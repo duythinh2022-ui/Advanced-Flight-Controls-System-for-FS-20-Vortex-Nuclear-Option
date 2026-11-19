@@ -2,7 +2,7 @@
 
 A flight control system mod for the stock **FS-20 Vortex** in Nuclear Option, with **F-35B-style STOVL control laws** "UCL or Unified Control Laws".
 
-- **CTOL:** carefree, full-authority handling across the envelope. Trailing-edge surfaces are stall-staggered, the elevons are modelled as flaps acting on the wing ahead of them, and there's delta-wing vortex lift. It compensates for asymmetric loads and resists departure on a damaged airframe.
+- **CTOL:** carefree, full-authority handling across the envelope. It compensates for asymmetric loads and resists departure on a damaged airframe.
 - **STOVL** (hold Flight Assist to convert, at 460 km/h or below):
   - **Throttle:** works as a speed lever with a zero-ground-speed detent.
   - **Hover:** the stick commands translational rate; a released stick holds the spot and the height.
