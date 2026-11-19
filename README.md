@@ -13,32 +13,6 @@ A flight control system mod for the stock **FS-20 Vortex** in Nuclear Option, wi
   - **Pirouette:** optional pedal pirouette on a hotkey.
   - **Stability Assist off:** freestyle flying.
 
-Per-version changes: [CHANGELOG.md](CHANGELOG.md).
-
-## Install (players)
-
-Download the release zip and put `Vortex_FS20_FCS.dll` and `meta.json` in `BepInEx\plugins\Vortex_FS20.FCS\`. Settings are in `BepInEx\config\Vortex_FS20.FCS.cfg`. The advanced settings (`Vortex_FS20.FCS.Dev.cfg`) need the optional DevUnlock DLL (source in `DevUnlock/`).
-
-## Layout
-
-- `Vortex_FS20.FCS/`: the plugin source.
-  - The STOVL laws are in `Stovl.cs`.
-  - The game side is in `SwivelLink.cs` and `StovlHooks.cs`.
-  - Settings are in `Plugin.cs`.
-- `native/`: the allocator's native core. The Rust source is in `fcs_core/`, and `prebuilt/Vortex_FcsCore.dll` is embedded into the plugin at build time.
-- `DevUnlock/`: the optional DLL that unlocks the advanced settings.
-
-## Build
-
-```
-bash build.sh Vortex_FS20.FCS Vortex_FS20_FCS.dll
-```
-
-- **Needs:** the .NET 8 SDK (its Roslyn `csc`), plus the game's `NuclearOption_Data/Managed` and `BepInEx/core` folders.
-- **Paths:** set `M=` and `B=` at the top of `build.sh` to where those folders are on your machine.
-- **Output name:** the assembly name comes from the output file name, so keep it `Vortex_FS20_FCS.dll`.
-- **Reproducible:** the build is deterministic.
-
 ## License
 
-[PolyForm Noncommercial 1.0.0](LICENSE): free to use, modify and share for noncommercial purposes. Commercial use needs the author's permission.
+[PolyForm Noncommercial 1.0.0](LICENSE)
