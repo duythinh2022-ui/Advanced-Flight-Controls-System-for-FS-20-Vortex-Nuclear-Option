@@ -1420,6 +1420,45 @@ namespace Vortex_FS20.FCS
 
 		// 0.2.8: the factor (0..1) on a tilt command's rate away from level: the bank and the pitch tilt share the budget in
 		// proportion to what each asks (tan(tilt) x rate, the lift each takes per second, per unit of lift)
+		// Vortex 0.5.14 (StovlClimbShare): how a stick climb's acceleration c and the translation's asked acceleration h divide
+		// the lift at full dry thrust M, with what stands before them (A: the weight, the vertical floor, the thrust-lag
+		// reserve). Each is first held to what it could have alone (c to M - A, h to sqrt(M^2 - A^2)). Were both to ask for
+		// all of that, both would be scaled by the one factor s that puts them on the limit, (A + s c)^2 + (s h)^2 = M^2:
+		// that is each one's share (hE out: the translation's). Either may also use what the other leaves of its own, so
+		// the climb gets its share or what the translation's present ask leaves, whichever is more (returned), and the
+		// translation gets the rest: its whole ask up to its share.
+		private static float ClimbPart(float A, float c, float h, float M, out float hE)
+		{
+			float cb = Mathf.Min(c, Mathf.Max(0f, M - A));
+			float hmax = Mathf.Sqrt(Mathf.Max(0f, M * M - A * A));
+			hE = hmax;
+			if (cb <= 0.0001f || hmax <= 0.0001f)
+			{
+				return cb;
+			}
+			float qa = cb * cb + hmax * hmax;
+			float qb = A * cb;
+			float sF = Mathf.Clamp01((Mathf.Sqrt(Mathf.Max(0f, qb * qb - qa * (A * A - M * M))) - qb) / qa);
+			hE = sF * hmax;
+			float hAct = Mathf.Min(h, hmax);
+			return Mathf.Min(cb, Mathf.Max(sF * cb, Mathf.Sqrt(Mathf.Max(0f, M * M - hAct * hAct)) - A));
+		}
+
+		private float aVcLast;
+
+		private float aVfLast;
+
+		private float aHwLast;
+
+		private float vShare = 1f;
+
+		// (the vertical demand asked last tick and the part of it that is the floor, for the governor's headroom)
+		private float govVAsk;
+
+		private float govVFloor;
+
+		public float dbgVShare => vShare;
+
 		private float GovLambda(bool inc, float rateDeg)
 		{
 			if (!VhGovern || (!inc && !VhGovernDown))
@@ -1559,6 +1598,7 @@ namespace Vortex_FS20.FCS
 				freeThetaHold = false;
 				psiHold = false;
 				psiDotPedal = 0f;
+				psiJInit = false;
 				rateFFInit = false;
 			}
 			float aPitch = Mathf.Clamp(AuthorityShare * I.authority.y, 8f, 120f);
@@ -1792,6 +1832,58 @@ namespace Vortex_FS20.FCS
 		// Vortex 0.4.7: the pedal's yaw-rate command as the yaw loop gets it (behind the plan the bank is given by the bank
 		// loop's lag, where the turn needs the bank)
 		private float psiPedLag;
+
+		// Vortex 0.5.12 (StovlYawSideFF): the hover's heading-rate command as the bank lets it move (deg/s) and its
+		// acceleration (deg/s^2); the side acceleration the nozzle's yaw bearing makes per yaw acceleration (m/s^2 to the
+		// right per rad/s^2 nose right; negative for a nozzle behind the CG); the side acceleration asked of the bank
+		// against that push (m/s^2, to the right); the turn's side acceleration per heading rate as it went to the bank
+		// (the forward speed, m/s); the bank profile's lag margin (s)
+		private float psiDotJ;
+
+		private float aPsiJ;
+
+		private bool psiJInit;
+
+		private float kSideYaw;
+
+		private float aSideFF;
+
+		private float uTurnH;
+
+		// (what the yaw causes sideways, as it went to the bank - the turn's u x heading rate and the nozzle's push - and the
+		// bank that demand has had time to get: the same tilt-rate limit, then the bank loop's own approach, deg)
+		private float aSideYaw;
+
+		private float phiYawS;
+
+		private float phiYawG;
+
+		private float phiYawM;
+
+		private bool yawShareInit;
+
+		private bool yawShareWas;
+
+		private float tauBankYLast = 0.4f;
+
+		public float dbgNozSide;
+
+		public float dbgKSide => kSideYaw;
+
+		public float dbgPsiJ => psiDotJ;
+
+		public float dbgAPsiJ => aPsiJ;
+
+		// Vortex 0.5.13 (StovlYawPivot): the pivot's distance ahead of the CG (m), its side speed (m/s) and its place (world x, z)
+		private float kPiv;
+
+		public float dbgKPiv => kPiv;
+
+		public float dbgVPiv;
+
+		public float dbgPivX;
+
+		public float dbgPivZ;
 
 		// Vortex 0.4.7: the heading rate the hover's yaw law commanded last tick (pedal / heading hold; not the part that follows
 		// the bank in forward flight), deg/s
@@ -2329,8 +2421,19 @@ namespace Vortex_FS20.FCS
 				// fan pitch burst may take: a step loss d met by lift rising at r costs about (2/3) d^3 / r^2 of height.
 				float tMxNow = Mathf.Max(1f, (hw.MaxThrust - hw.ParasiticLoss * hw.Swivel * vnDriveNow) * Mathf.Max(0.05f, hw.AltFactor));
 				float ratioReq = Mathf.Clamp(dbgThrustReq / tMxNow, 0.05f, 1f);
+				// Vortex 0.5.14 (StovlClimbShare): the governor keeps a tilt from taking lift the thrust cannot make up in time,
+				// so the jet does not sink. Lift that is going into a stick climb's acceleration is lift in hand for that: a
+				// tilt that takes it slows the climb's acceleration and sinks nothing. So the headroom is counted from the
+				// thrust the vertical floor needs (the request scaled by the floor's lift over the lift asked), not from a
+				// request the climb itself has run up to the limit. 0.2.8-0.5.13: with a climb asked the request sat at the
+				// limit, the headroom was zero and no tilt came in until the climb had its rate.
+				float ratioGov = ratioReq;
+				if (Plugin.StovlClimbShare && govVAsk > govVFloor)
+				{
+					ratioGov = Mathf.Clamp(ratioReq * (9.81f + govVFloor) / (9.81f + govVAsk), 0.05f, 1f);
+				}
 				float hroom = Mathf.Max(0f, 0.95f - ratioReq) / ratioReq;
-				tiltBudget = VhTiltShare * hroom / EngineLag;
+				tiltBudget = VhTiltShare * (Mathf.Max(0f, 0.95f - ratioGov) / ratioGov) / EngineLag;
 				// (and the other way: a tilt coming out gives lift back, which the thrust has to shed: it falls as the same lag
 				// toward idle, within the spool rate)
 				float idleR = Mathf.Clamp01(0.15f * hw.MinRpm / Mathf.Max(1f, hw.MaxRpm - hw.MinRpm));
@@ -2497,6 +2600,7 @@ namespace Vortex_FS20.FCS
 			}
 			float aVbud;
 			float aH;
+			float aHask;
 			float aHlevel;
 			{
 				float g0 = 9.81f;
@@ -2507,13 +2611,44 @@ namespace Vortex_FS20.FCS
 				// tilt chased each other (bench, side + forward stop released together: pitch target 3 <-> 13 deg, nozzle
 				// 0.8 <-> 1.0, every 4.6 s, the vertical speed swinging -0.6..+0.6 m/s with it)
 				float aVres = Mathf.Max(0f, VhReserveFromError ? ((hHold && holdDir == 0f) ? (kVRate * kVHold * hErrLast) : aVhLast) : aVhLast);
+				// Vortex 0.5.14 (StovlClimbShare; Tom, 19 Nov: "when i command positive vertical speed and then a short moment
+				// later i command yaw, yaw took a while to kick in ... check if there is any other similar problem to that and
+				// fix"; "fix the other ones for the delay control"; "no on top fix"). A climb on the stick took the thrust
+				// first: its whole demand was kept back here, the translation got what was left (nothing, while the climb
+				// accelerates) and the governor had no thrust in hand to let a tilt in. Bench, 13.8 t, climb 0.5 s before:
+				// side stick 0.2 deg of bank in the first second and 4.2 s to 1 m/s (alone: 7.0 deg, 1.4 s), lever 3.5 s to
+				// 2 m/s (0.9 s), 30 kt pedal turn 4.5 s to half rate (1.3 s). Now the stick's climb acceleration and the
+				// translation's ask are two demands on the one budget, as fore-aft and sideways already are: when both
+				// together ask for more than the thrust holds, each has its share of it (the same factor on what each could
+				// have alone, ClimbPart) and may use what the other leaves, and the height loop asks for the climb's part
+				// (below), so the thrust in hand is there for the tilt. What is not
+				// shared: stopping a sink, holding a height and flying a height deficit back (the floor) keep their demand
+				// whole. Last tick's asks; the reserve for the thrust lag (aLag) is worked out on the shared demand.
+				bool shareOn = Plugin.StovlClimbShare && aVcLast > 0f && !I.wow;
+				float aVfP = Mathf.Max(0f, aVfLast);
+				if (shareOn)
+				{
+					aVres = aVfP + ClimbPart(g0 + aVfP, aVcLast, aHwLast, aMaxT, out var _);
+				}
 				float aH0 = Mathf.Sqrt(Mathf.Max(0f, aMaxT * aMaxT - (g0 + aVres) * (g0 + aVres)));
 				float tl = Mathf.Atan2(aH0, g0 + aVres);
 				// (0.4.0: at the faster axis's tilt rate)
 				float rateBud = TiltRate(Mathf.Max(aTiltRoll, aTiltPitch), Plugin.StovlTrcBankRate);
 				float aLag = g0 * Mathf.Tan(tl) / Mathf.Max(0.2f, Mathf.Cos(tl)) * rateBud * 0.0174532924f * tauV;
+				vShare = 1f;
+				float hShare = 0f;
+				if (shareOn)
+				{
+					float cAlone = Mathf.Min(aVcLast, Mathf.Max(0f, aMaxT - g0 - aVfP - aLag));
+					float cPart = ClimbPart(g0 + aVfP + aLag, aVcLast, aHwLast, aMaxT, out hShare);
+					vShare = (cAlone > 0.0001f) ? Mathf.Clamp01(cPart / cAlone) : 1f;
+					aVres = aVfP + cPart;
+				}
 				float aV = g0 + aVres + aLag;
 				aH = Mathf.Sqrt(Mathf.Max(0f, aMaxT * aMaxT - aV * aV));
+				// (the translation's share: the pedal's turn-rate limit below plans on this, so the turn it allows is not held to
+				// the little a climb leaves before the turn has asked for anything)
+				aHask = shareOn ? Mathf.Max(aH, hShare) : aH;
 				aVbud = ((VhFwdCapFromFit && fReqYInit) ? (fReqYF / Mathf.Max(1f, I.mass)) : (g0 + aVres)) + VhFwdCapLag * aLag;
 				// (the same with no vertical demand: the hover's own stopping capability, for where a stop comes to rest)
 				aHlevel = Mathf.Sqrt(Mathf.Max(0f, aMaxT * aMaxT - (g0 + aLag) * (g0 + aLag)));
@@ -2577,6 +2712,26 @@ namespace Vortex_FS20.FCS
 			// Vortex 0.4.2 (StovlPosKeepSpeed, 0 = no limit): a spot once held is kept whatever the speed: only the lever or the
 			// lateral stick gives it up. With the 3 m/s limit a gust of 3 m/s or more let go of it and the jet was left where
 			// the gust had put it (bench, 3 m/s sideways kick: 5.0 m off).
+			// Vortex 0.5.13 (StovlYawPivot; Tom, 19 Nov: "the f-35 demo, it has basically zero visible banking for yaw at least
+			// when stationary", "yaw on the f-35b irl is also very snappy"): the hover is held at the yaw's own pivot, not at the
+			// CG. The nozzle's yaw bearing pushes the tail sideways; that push turns the jet and moves its CG (side acceleration
+			// = kSideYaw x yaw acceleration, 0.5.12), and the one point it does not move is the one -kSideYaw ahead of the CG
+			// (yaw inertia / (mass x the nozzle's arm): the centre of percussion, 3.2 m at 13.8 t). A yaw made by the nozzle
+			// turns the jet about that point by itself: the CG's swing round it is exactly the side speed the push gives and
+			// takes away again, so nothing has to be banked for. 0.1.0-0.5.10 held the CG and banked against the swing once
+			// it showed (0.64 m/s of skid, 6.3 deg of bank at each yaw start and stop); 0.5.12 banked ahead of it and made the
+			// yaw wait for the bank (5.4 deg, 0.7 s later to full rate and to rest). Here the side speed the side loop and the
+			// position hold see is the pivot's (the CG's plus arm x heading rate, measured), and the spot held is the pivot's.
+			// Fore-aft nothing changes: the pivot's speed along the nose is the CG's, and the pull that keeps the CG on its
+			// circle (arm x heading rate^2) is already what the turn's own term asks for (aGsW -= v x heading rate, 0.4.7,
+			// with v the CG's). The arm fades with the hover's pedal law (lamY); zero on the wheels.
+			float psiRate = Vector3.Dot(root.right * (0f - I.rates.y) + root.up * I.rates.z + root.forward * (0f - I.rates.x), up) * 0.0174532924f;
+			kPiv = (Plugin.StovlYawPivot && !I.wow && Mathf.Abs(kSideYaw) > 0.05f) ? ((0f - kSideYaw) * lamY) : 0f;
+			float vPiv = v + kPiv * psiRate;
+			Vector3 posPiv = I.pos + hdg * kPiv;
+			dbgVPiv = vPiv;
+			dbgPivX = posPiv.x;
+			dbgPivZ = posPiv.z;
 			float posKeep = Plugin.StovlPosKeepSpeed;
 			bool posWanted = gsCmd == 0f && Mathf.Abs(I.sr) < 0.05f && (posHold ? (posKeep <= 0f || gs < posKeep) : (gs < Mathf.Clamp(Plugin.StovlPosCatchSpeed, 0.2f, 3f))) && !I.wow;
 			if (posWanted && !posHold)
@@ -2584,9 +2739,9 @@ namespace Vortex_FS20.FCS
 				posHold = true;
 				// 0.2.7: caught where the jet will come to rest (the stop at the translation budget, after the tilt's lag), not
 				// where it is: caught at up to 3 m/s, the hold ran on ~2 m past it and flew back at ~1 kt (bench, 30 kt stop)
-				Vector3 vh = new Vector3(vg.x, 0f, vg.z);
+				Vector3 vh = new Vector3(vg.x, 0f, vg.z) + rgt * (kPiv * psiRate);
 				float aStopH = Mathf.Max(aHlevel, 0.5f);
-				posRef = I.pos + vh * (vh.magnitude / (2f * aStopH) + 0.5f);
+				posRef = posPiv + vh * (vh.magnitude / (2f * aStopH) + 0.5f);
 			}
 			else if (!posWanted)
 			{
@@ -2605,7 +2760,7 @@ namespace Vortex_FS20.FCS
 			if (posHold)
 			{
 				posRef += vSurf * dt;
-				Vector3 e = posRef - I.pos;
+				Vector3 e = posRef - posPiv;
 				gsCmd += Mathf.Clamp(0.3f * Vector3.Dot(e, hdg), -2f, 2f);
 				latHold = Mathf.Clamp(0.3f * kRollS * Vector3.Dot(e, rgt), -2f, 2f);
 			}
@@ -2658,7 +2813,7 @@ namespace Vortex_FS20.FCS
 			if (pirX && !pirXOn)
 			{
 				pirDir = hdg;
-				pirSkid = rgt * (v - (I.sr * vTrcMax + latHold));
+				pirSkid = rgt * (vPiv - (I.sr * vTrcMax + latHold));
 			}
 			pirXOn = pirX;
 			float wPir = pirX ? lamY : 0f;
@@ -2670,7 +2825,7 @@ namespace Vortex_FS20.FCS
 				vCmd = Mathf.Lerp(vCmd, Vector3.Dot(cmdE, rgt), wPir);
 				dbgGsCmd = gsCmd;
 			}
-			float eV = vCmd - v;
+			float eV = vCmd - vPiv;
 			// (0.4.0: the profiles' jerk from each axis's tilt rate)
 			float rateSideP = TiltRate(aTiltRoll, Plugin.StovlTrcBankRate * kRollS);
 			float rateFwdP = TiltRate(aTiltPitch, Plugin.StovlTrcBankRate);
@@ -2725,8 +2880,9 @@ namespace Vortex_FS20.FCS
 			// nose. 0.1.0-0.4.6 left it to the feedback, which only acts once the skid is there: 22:56 log, 70-74 s, full left
 			// pedal at 22 m/s with the stick released: 13 m/s of skid (37 deg of sideslip) in 4.5 s, and from then on the whole
 			// bank budget went into holding it (u psiDot = 5 m/s^2), so neither a right nor a left stick moved the bank.
-			float psiRate = Vector3.Dot(root.right * (0f - I.rates.y) + root.up * I.rates.z + root.forward * (0f - I.rates.x), up) * 0.0174532924f;
 			dbgPsiRate = psiRate * 57.29578f;
+			float aTurnW = 0f;
+			float uTurnW = 0f;
 			// (the heading rate the yaw law itself commanded last tick, pedal or heading hold, which leads the measured one by
 			// the yaw loop's lag; a yaw the law did not command is left to the feedback)
 			if (Plugin.StovlTurnCoordinate && !I.wow)
@@ -2734,13 +2890,40 @@ namespace Vortex_FS20.FCS
 				float psiFF = VhTurnFFCmd ? (psiDotFF * 0.0174532924f) : psiRate;
 				// (0.5.6: not in the pedal pirouette, whose velocity stays where it is while the nose turns)
 				psiFF *= 1f - wPir;
-				aLatW += u * psiFF;
+				aTurnW = u * psiFF;
+				uTurnW = u * (1f - wPir);
+				aLatW += aTurnW;
 				aGsW -= v * psiFF;
+			}
+			// Vortex 0.5.12 (StovlYawSideFF; Tom, 19 Nov: "yaw creates side skidding at the start and stop, could the roll post
+			// be coupled so that the side skidding is gone or very small"; "also whenever the fcs modulates the yaw rate";
+			// "1 logic but works both ways"; "the least fixed gains as possible, more model and physics based"): one force
+			// balance for the two axes. The hover's yaw is the main nozzle's bearing pushing the tail sideways, and that push
+			// moves the whole jet: side acceleration = kSideYaw x yaw acceleration, kSideYaw from the nozzle's geometry and
+			// thrust (yaw inertia / (mass x the nozzle's arm), 3.2 m at 13.8 t). The bank is the only thing that pushes back
+			// (the roll posts are vertical: they tilt the lift, g tan(bank)). So: (a) the bank is asked for the side
+			// acceleration that cancels the push of the yaw acceleration the yaw command wants (aSideFF, from the yaw law below,
+			// last tick), on top of the translation's own demand, through the same tilt-rate limit and governor as any bank;
+			// (b) the yaw law below lets the heading rate change only as fast as the bank that demand has had time to get
+			// cancels (the same tilt-rate limit and bank loop, followed for this share of the demand alone). The same
+			// balance carries the turn at speed: what the yaw causes sideways is the nozzle's push and the turn's own u x
+			// heading rate (aTurnW above), and the bank has to be there for both before the yaw takes more. 0.5.10
+			// left the push to the side-speed feedback: bench, 13.8 t hover, full pedal: 0.64 m/s of skid at the yaw's start
+			// and 0.65 at its stop, the bank ~0.9 s behind the push, then 0.24 / 0.26 m/s back the other way.
+			tauBankYLast = tauBankY;
+			float aYawW = aTurnW;
+			dbgNozSide = 0f;
+			if (Plugin.StovlYawSideFF && !I.wow)
+			{
+				dbgNozSide = aSideFF;
+				aLatW += aSideFF;
+				aYawW += aSideFF;
 			}
 			// (for the pedal's yaw-rate limit: what the fore-aft demand of the moment leaves of the budget sideways, and never
 			// less than the sideways half of an equally divided budget, aHv / sqrt(2); 1 s low-pass)
 			{
-				float aTurnNow = Mathf.Sqrt(Mathf.Max(0.5f * aHv * aHv, aHv * aHv - aGsW * aGsW));
+				float aHt = Mathf.Max(aHask, 0.2f);
+				float aTurnNow = Mathf.Sqrt(Mathf.Max(0.5f * aHt * aHt, aHt * aHt - aGsW * aGsW));
 				if (!aTurnInit)
 				{
 					aTurnInit = true;
@@ -2749,6 +2932,7 @@ namespace Vortex_FS20.FCS
 				aTurnF += (aTurnNow - aTurnF) * (dt / (1f + dt));
 			}
 			float aHw = Mathf.Sqrt(aLatW * aLatW + aGsW * aGsW);
+			aHwLast = I.wow ? 0f : aHw;
 			// (0.2.9: not on the wheels, where nothing tilts: the translation budget held a full-lever take-off roll to ~4 m/s^2,
 			// the engine throttled back to 0.48-0.61 below 35 kt; bench S1)
 			float hScale = (aHw > aHv && !I.wow) ? (aHv / aHw) : 1f;
@@ -2795,6 +2979,8 @@ namespace Vortex_FS20.FCS
 			}
 			float aGs = aGsW * hScale;
 			float aYTrc = aLatW * hScale;
+			uTurnH = uTurnW * hScale;
+			aSideYaw = aYawW * hScale;
 			float aAcc;
 			if (Mathf.Abs(thrE - tc) <= tw)
 			{
@@ -2965,6 +3151,23 @@ namespace Vortex_FS20.FCS
 			vGainF = Mathf.MoveTowards(vGainF, holdingNow ? 1f : 0f, dt / 0.5f);
 			float aVhRaw = Mathf.Lerp(kVRateL, kVRate, vGainF) * (hdotCmd - hdot) + aEnv + hInt + hdotFF;
 			float aVh = Mathf.Clamp(aVhRaw, -4f, aVhHi);
+			// Vortex 0.5.14 (StovlClimbShare, see the translation budget): with the stick asking for a climb, the demand is
+			// the floor (what it would be were the command only "do not sink": stopping a sink, the integral) plus the climb's
+			// own acceleration, and that part is what shares the budget with the translation.
+			aVcLast = 0f;
+			aVfLast = aVh;
+			if (Plugin.StovlClimbShare && sp >= 0.05f && !I.wow)
+			{
+				float aVf = Mathf.Clamp(Mathf.Lerp(kVRateL, kVRate, vGainF) * (Mathf.Min(hdotCmd, Mathf.Max(0f, hdot)) - hdot) + aEnv + hInt + hdotFF, -4f, aVhHi);
+				if (aVh > aVf)
+				{
+					aVfLast = aVf;
+					aVcLast = aVh - aVf;
+					aVh = aVf + vShare * aVcLast;
+				}
+			}
+			govVAsk = aVh;
+			govVFloor = Mathf.Max(0f, aVfLast);
 			aVhLast = aVh;
 			if (I.wow || lamV < 0.01f)
 			{
@@ -3672,6 +3875,14 @@ namespace Vortex_FS20.FCS
 			float rateSide = TiltRate(aTiltRoll, Plugin.StovlTrcBankRate * kRollS);
 			dbgTiltRateA = aTiltRoll * Plugin.StovlTiltStopTime;
 			dbgTiltRate = rateSide;
+			// (Vortex 0.5.12: the same path followed for the yaw's own share of the demand alone - the turn's u x heading rate
+			// and the nozzle's push - so the yaw law knows how much of that bank is there by now: the tilt-rate limit here,
+			// then the governor's rate and the bank loop's own approach below)
+			{
+				float phiYawRaw = Mathf.Atan2(aSideYaw, g) * 57.29578f;
+				yawShareInit = !(wLat < 0.01f || !lawInitTrc || I.wow);
+				phiYawS = yawShareInit ? Mathf.MoveTowards(phiYawS, phiYawRaw, rateSide * dt) : phiYawRaw;
+			}
 			phiTrcF = (wLat < 0.01f || !lawInitTrc) ? phiTrcRaw : Mathf.MoveTowards(phiTrcF, phiTrcRaw, rateSide * dt);
 			lawInitTrc = true;
 			float phiTrc = phiTrcF;
@@ -3700,6 +3911,9 @@ namespace Vortex_FS20.FCS
 			dbgPhiMax = phiMax;
 			float phiBank = Mathf.Clamp(I.sr * Plugin.StovlBankMax, -phiMax, phiMax);
 			float phiCmd = Mathf.Lerp(phiBank, phiTrc, wLat);
+			bool govIncYaw = false;
+			float govRateYaw = 60f;
+			float govSgnYaw = 0f;
 			if (VhGovern && lamRoll < 0.99f && !I.wow)
 			{
 				// 0.2.8: the bank command moves toward its target at the bank loop's own top rate; past level on the target's
@@ -3713,6 +3927,9 @@ namespace Vortex_FS20.FCS
 				}
 				bool incPhi = Mathf.Abs(phiCmd) > Mathf.Abs(phiG) && phiCmd * phiG >= 0f;
 				float lamG = GovLambda(incPhi, 60f);
+				govIncYaw = incPhi;
+				govRateYaw = 60f * lamG;
+				govSgnYaw = Mathf.Sign(phiCmd);
 				float lvl = (phiCmd * phiG < 0f) ? 0f : phiCmd;
 				// (toward level, or to a smaller bank on the same side: free)
 				float phiG0 = phiG;
@@ -3731,6 +3948,22 @@ namespace Vortex_FS20.FCS
 				retPhiLast = 0f;
 			}
 			dbgPhiCmd = phiCmd;
+			// (Vortex 0.5.12, the yaw's share of the bank, continued: a bank coming in moves no faster than the governor lets
+			// the whole bank command move this tick - the thrust in hand for the lift the tilt takes - then the bank loop's
+			// approach to it)
+			if (yawShareInit && yawShareWas)
+			{
+				bool incYw = govIncYaw && (phiYawS - phiYawG) * govSgnYaw > 0f && phiYawG * govSgnYaw >= 0f;
+				phiYawG = Mathf.MoveTowards(phiYawG, phiYawS, (incYw ? govRateYaw : 60f) * dt);
+				float eYw = phiYawG - phiYawM;
+				phiYawM = Mathf.MoveTowards(phiYawM, phiYawG, Mathf.Abs(Stop(eYw, BankLoopGain() * kRollS, (eYw > 0f) ? aRollP : aRollN, 60f)) * dt);
+			}
+			else
+			{
+				phiYawG = phiYawS;
+				phiYawM = phiYawS;
+			}
+			yawShareWas = yawShareInit;
 			float ePhiB = Mathf.DeltaAngle(I.phi, phiCmd);
 			// Vortex 0.4.2 (StovlBankGainFromMargin, off by default): the translation bank loop at 1 / StovlTrcLagMargin instead
 			// of 2.5 / s, so the bank trails a moving target by the margin the side-velocity profile is given (3.1 / s for
@@ -3851,12 +4084,28 @@ namespace Vortex_FS20.FCS
 					pedalTgt = Mathf.Max(pedalTgt, -Stop(bLim - I.beta, 2.5f, aLeft, yawRateMax));
 				}
 			}
+			// Vortex 0.5.12 (StovlYawSideFF): the side acceleration the nozzle's yaw bearing makes per yaw acceleration, from the
+			// nozzle's geometry and thrust now: half its push from full left to full right bearing over the mass, against the yaw
+			// axis's authority (I.authority.z, the same half range) - so the ratio is the yaw inertia over mass x arm.
+			kSideYaw = 0f;
+			if (hw != null && hw.Valid && I.mass > 1000f && NozzleAt(hw.Swivel, 1f, out var dYp, out var pYp) && NozzleAt(hw.Swivel, -1f, out var dYn, out var _))
+			{
+				Transform rootK = ((Component)(object)ac).transform;
+				Vector3 dD = (dYp - dYn) * 0.5f;
+				float sideAcc = hw.NozzleThrust * Vector3.Dot(dD, rootK.right) / I.mass;
+				float yawSgn = Mathf.Sign(Vector3.Dot(Vector3.Cross(pYp - hw.CenterOfMass, dD), rootK.up));
+				float aYawFull = Mathf.Max(1f, I.authority.z) * 0.0174532924f;
+				kSideYaw = Mathf.Abs(sideAcc) / aYawFull * Mathf.Sign(sideAcc) * yawSgn;
+			}
+			// (not in the pedal pirouette, which turns the nose at the yaw axis's full rate and leaves the skid alone)
+			bool sideFF = Plugin.StovlYawSideFF && !I.wow && !pirOn && Mathf.Abs(kSideYaw) > 0.05f && lamY > 0.01f;
 			psiDotPedal = Mathf.MoveTowards(psiDotPedal, pedalTgt, yawSlew * dt);
 			psiPedLag = (turnLag > 0f && !(I.wow && airT <= 0f)) ? (psiPedLag + (psiDotPedal - psiPedLag) * (dt / (turnLag + dt))) : psiDotPedal;
 			if (Mathf.Abs(I.sy) < 0.05f)
 			{
 				// pedals released: the yaw rate is brought to zero, then the heading where it stopped is held
-				if (!psiHold && Mathf.Abs(psiPedLag) < 0.5f && Mathf.Abs(I.rates.z) < 3f)
+				// (0.5.12: and the bank-paced command below has come to rest too)
+				if (!psiHold && Mathf.Abs(psiPedLag) < 0.5f && Mathf.Abs(I.rates.z) < 3f && (!sideFF || !psiJInit || Mathf.Abs(psiDotJ) < 0.5f))
 				{
 					psiHold = true;
 					psiRef = psi;
@@ -3867,6 +4116,66 @@ namespace Vortex_FS20.FCS
 			{
 				psiHold = false;
 				psiDotH = psiPedLag;
+			}
+			// Vortex 0.5.12 (StovlYawSideFF, see the sideways demand above): the pedal's heading rate (its start, its stop, and
+			// every change the law itself makes to it: the turn limit, the authority moving)
+			// is followed as the bank lets it.
+			// (a) What is asked of the bank: with e the heading-rate change still to make, the yaw acceleration from which
+			//     taking the bank off again lands on the target is the bank profile's own a^2 / (2 j) + a tau = |k| e (the jerk
+			//     j of the bank's tilt rate and the lag margin tau the sideways profile uses), no more than the yaw axis has.
+			// (b) What the yaw gets: the acceleration whose push the bank that has come for it cancels, after what the turn at
+			//     this speed and heading rate takes of it (u x heading rate): (the turn's - g tan(that bank)) / k, the pedal's
+			//     way only, never past the target. That bank is the yaw's share of the demand followed through the tilt-rate
+			//     limit and the bank loop (phiYawM): a model, so nothing the translation is doing can hold the yaw up, and the
+			//     yaw's stop is never waiting on a bank that is busy elsewhere. The heading hold's own small corrections stay
+			//     direct.
+			aSideFF = 0f;
+			if (sideFF && psiJInit && !psiHold && !(I.wow && airT <= 0f))
+			{
+				float kAbs = Mathf.Abs(kSideYaw);
+				float eJ = (psiDotH - psiDotJ) * 0.0174532924f;
+				float jB = Mathf.Max(0.01f, 9.81f * rateSide * 0.0174532924f);
+				float tauB = Mathf.Max(0.05f, tauBankYLast);
+				float aWant = Mathf.Min(kAbs * aYaw * 0.0174532924f, jB * (Mathf.Sqrt(tauB * tauB + 2f * kAbs * Mathf.Abs(eJ) / jB) - tauB));
+				// (the bank's push to cancel a yaw acceleration a is -k a: to the right for a nose-right one behind the CG)
+				aSideFF = lamY * (0f - Mathf.Sign(kSideYaw)) * Mathf.Sign(eJ) * aWant;
+				float aBank = 9.81f * Mathf.Tan(Mathf.Clamp(phiYawM, -60f, 60f) * 0.0174532924f);
+				// (the turn at the heading rate the yaw has been given so far; the bank's demand above runs on the pedal's own
+				// command, a bank-loop lag ahead of it, as since 0.4.7)
+				float aGate = (uTurnH * psiDotJ * 0.0174532924f - aBank) / kSideYaw;
+				float aLim = Mathf.Min(aYaw * 0.0174532924f, Mathf.Abs(eJ) / Mathf.Max(dt, 0.0001f));
+				float aBanked = (aGate * eJ > 0f) ? (Mathf.Sign(eJ) * Mathf.Min(Mathf.Abs(aGate), aLim)) : 0f;
+				// (outside the hover regime the heading rate is the coordinated turn's and the pedal's part follows at once)
+				float aDir = Mathf.Sign(eJ) * aLim;
+				float wBank = lamY;
+				// Vortex 0.5.13 (StovlYawPivot): held at the pivot, the nozzle's push needs no bank, so nothing is asked of the
+				// bank for it and the hover's yaw waits for nothing. What the bank still has to carry is the turn at speed
+				// (u x heading rate, at the pivot as at the CG), and there the same balance stays: the heading rate goes the
+				// pedal's way only as far as the bank that has come for the turn carries it (g tan(that bank) / u, the yaw's
+				// share followed through the tilt-rate limit, the governor and the bank loop as in 0.5.12). The nozzle cannot
+				// fill a gap there any more (its push does not move the pivot), so the rate follows the bank itself. This
+				// counts by how far the jet flies in one bank lag against the pivot's arm (u tau / arm, 1 from ~15 kt at
+				// 13.8 t): below that the skid a late bank would leave is smaller than the CG's own swing.
+				if (Plugin.StovlYawPivot)
+				{
+					aSideFF = 0f;
+					aBanked = 0f;
+					if (Mathf.Abs(uTurnH) > 0.01f)
+					{
+						float room = (aBank / uTurnH - psiDotJ * 0.0174532924f) * Mathf.Sign(eJ);
+						aBanked = Mathf.Sign(eJ) * Mathf.Min(aLim, Mathf.Max(0f, room) / Mathf.Max(dt, 0.0001f));
+					}
+					wBank = lamY * Mathf.Clamp01(Mathf.Abs(uTurnH) * tauB / kAbs);
+				}
+				aPsiJ = Mathf.Lerp(aDir, aBanked, wBank) * 57.29578f;
+				psiDotJ += aPsiJ * dt;
+				psiDotH = psiDotJ;
+			}
+			else
+			{
+				psiJInit = true;
+				psiDotJ = psiDotH;
+				aPsiJ = 0f;
 			}
 			float psiDotP = (vA > 5f) ? (g * Mathf.Tan(Mathf.Clamp(I.phi, -80f, 80f) * 0.0174532924f) / vA * 57.29578f) : 0f;
 			float psiDot = Mathf.Lerp(psiDotP, psiDotH, lamY);
@@ -3888,6 +4197,7 @@ namespace Vortex_FS20.FCS
 				if (Mathf.Abs(I.sy) < 0.05f || wPed < 0.01f)
 				{
 					psiDotPedal = 0f;
+				psiJInit = false;
 				}
 			}
 			// Euler rates -> body rates
