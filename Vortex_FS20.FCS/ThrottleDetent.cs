@@ -67,7 +67,7 @@ namespace Vortex_FS20.FCS
 			{
 				h.Patch(AccessTools.Method(typeof(PilotPlayerState), "PlayerThrottleAxis1Controls"), null, new HarmonyMethod(typeof(ThrottleDetent), "Postfix"));
 			});
-			TryHookDetents();
+			TryHookDetents(false);
 		}
 
 		// Vortex 0.2.1: the Detents mod (com.baanish.nuclearoption.detents) stands its idle and afterburner detents down while
@@ -85,7 +85,33 @@ namespace Vortex_FS20.FCS
 
 		private static Func<Aircraft, bool> detentsWrapped;
 
-		private static void TryHookDetents()
+		// Vortex 0.5.11 (tester report 19 Nov: 360 -> 10 fps, Detents mod not installed): 0.2.1-0.5.10 looked the type up with
+		// AccessTools.TypeByName, which on a miss scans every type of every loaded assembly twice and logs a warning, and a miss
+		// left detentsHookDone false, so Run() repeated it on every throttle frame in any jet. Now: each assembly's own
+		// GetType(name) (a hash lookup, no type scan, no log line), and once the chainloader is done (final = the call from
+		// Run(), only reached in a cockpit) a miss is final: without the Detents mod the lookup runs at most twice per session.
+		private const string DetentsCompatType = "NuclearOptionDetents.Compatibility.RuntimeCompatibility";
+
+		private static Type FindDetentsCompat()
+		{
+			foreach (System.Reflection.Assembly asm in AppDomain.CurrentDomain.GetAssemblies())
+			{
+				try
+				{
+					Type t = asm.GetType(DetentsCompatType, false);
+					if (t != null)
+					{
+						return t;
+					}
+				}
+				catch
+				{
+				}
+			}
+			return null;
+		}
+
+		private static void TryHookDetents(bool final)
 		{
 			if (detentsHookDone || harmony == null)
 			{
@@ -93,9 +119,14 @@ namespace Vortex_FS20.FCS
 			}
 			try
 			{
-				Type rc = AccessTools.TypeByName("NuclearOptionDetents.Compatibility.RuntimeCompatibility");
+				Type rc = FindDetentsCompat();
 				if (rc == null)
 				{
+					if (final)
+					{
+						detentsHookDone = true;
+						Plugin.Log.LogInfo("Vortex FCS: Detents mod not loaded; its STOVL suspend is not needed.");
+					}
 					return;
 				}
 				detentsHookDone = true;
@@ -232,7 +263,7 @@ namespace Vortex_FS20.FCS
 		{
 			if (!detentsHookDone)
 			{
-				TryHookDetents();
+				TryHookDetents(true);
 			}
 			ControlInputs ci = fInputs(st);
 			Pilot pilot = fPilot(st);
