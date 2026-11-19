@@ -1,6 +1,6 @@
 # FS-20 Vortex FCS (Nuclear Option)
 
-A flight control system mod for the stock **FS-20 Vortex** in Nuclear Option, with **F-35B-style STOVL control laws**. BepInEx plugin `Vortex_FS20.FCS`, version **0.5.10**.
+A flight control system mod for the stock **FS-20 Vortex** in Nuclear Option, with **F-35B-style STOVL control laws** "UCL or Unified Control Laws". BepInEx plugin `Vortex_FS20.FCS`, version **0.5.10**.
 
 - **CTOL:** carefree, full-authority handling across the envelope. Trailing-edge surfaces are stall-staggered, the elevons are modelled as flaps acting on the wing ahead of them, and there's delta-wing vortex lift. It compensates for asymmetric loads and resists departure on a damaged airframe.
 - **STOVL** (hold Flight Assist to convert, at 460 km/h or below):
