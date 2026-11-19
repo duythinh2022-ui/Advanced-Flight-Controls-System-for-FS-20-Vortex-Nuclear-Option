@@ -14,6 +14,8 @@ A flight control system mod for the stock **FS-20 Vortex** in Nuclear Option, wi
   - **Stability Assist off:** freestyle flying.
 
 Disclaimer, the mod's code is entirely written by Claude Opus and Fable.
+
+Incompatible or partially works with Vortex family mod to be more exact. 
 ## License
 
 [PolyForm Noncommercial 1.0.0](LICENSE)
