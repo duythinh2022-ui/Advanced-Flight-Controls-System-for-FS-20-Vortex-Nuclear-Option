@@ -662,7 +662,7 @@ namespace Vortex_FS20.FCS
 				float step = Mathf.Max(22f, src.fontSize * 0.65f);
 				// one line further down while the Detents mod's indicator is up
 				Transform other = center.Find("NuclearOptionDetents_HudIndicator");
-				int lines = (other != null && other.gameObject.activeInHierarchy) ? 2 : 1;
+				int lines = ((other != null && other.gameObject.activeInHierarchy) ? 2 : 1) + (HudThrottle.HudMinShown ? 1 : 0);
 				lbl.transform.localPosition = center.InverseTransformPoint(src.transform.position) + new Vector3(0f, -step * lines, 0f);
 				bool vis = src.enabled && src.gameObject.activeInHierarchy;
 				if (go.activeSelf != vis)

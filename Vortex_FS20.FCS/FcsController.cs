@@ -854,6 +854,9 @@ namespace Vortex_FS20.FCS
 		public float slipAuthDbg = 25f;
 		public float slipStiffDbg;
 
+		// Vortex 0.5.22 (StovlStiffDynScale): the dynamic pressure (rho V^2) at the last stiffness probe
+		private float slipStiffQ;
+
 		// 3.1.0: the 2.31.2 passive-airframe telemetry (PassiveStep) is archived (C:\Games\NO mods\F22E-FCS-retired-passive-step). Its CSV
 		// columns (psAX..psNr, cePassXP..cePassSN) are kept and write 0. AirframeMomentAt stays: the bench's sliptruth tool uses it.
 		private List<(ControlSurface cs, AeroPart host, AirfoilTable table)> psCamber;
@@ -1527,6 +1530,10 @@ namespace Vortex_FS20.FCS
 
 		// Vortex 0.2.9: the CTOL blend (StovlSystem.CtolW): the mode the CTOL laws run in, and whether they ran last tick
 		private FcsMode stovlCtolMode = FcsMode.Rate;
+
+		// Vortex 0.5.22a (StovlCtolNoseHold): the pitch rate that keeps the pitch attitude in a banked turn, r tan(bank), fed
+		// into the CTOL pitch law's rate command during the STOVL CTOL blend, ahead of the AoA envelope and the rate budget
+		private float ctolQTurnFF;
 
 		private bool stovlCtolWas;
 
@@ -4858,7 +4865,7 @@ namespace Vortex_FS20.FCS
 				slipProbeTimer = 0f;
 				// the sign of a restoring yaw moment, latched once at low AoA where any conventional airframe is directionally
 				// stable (the probe's sweep gives it: the yaw moment grows with the sideslip one way or the other)
-				if (slipSignR == 0f && Mathf.Abs(alpha) < 10f && tas > 60f)
+				if (slipSignR == 0f && Mathf.Abs(alpha) < 10f && tas > (Plugin.SlipSignLatchSlow ? 30f : 60f))
 				{
 					float n0 = AccYaw(SlipMomentAt(alpha, 0f, rho, rootRot, ref ctx));
 					float nP = AccYaw(SlipMomentAt(alpha, 8f, rho, rootRot, ref ctx));
@@ -4915,6 +4922,7 @@ namespace Vortex_FS20.FCS
 					slipDepDbg = dep;
 					slipAuthDbg = auth;
 					slipStiffDbg = stiff;
+					slipStiffQ = rho * tas * tas;
 					slipTolDbg = Mathf.Min(dep, auth);
 					// Revoker 0.4.0: the airframe's yaw damping at the present AoA and sideslip, deg/s^2 per deg/s of body yaw rate (negative = damping)
 					float nR0 = AccYaw(SlipMomentAt(alpha, beta, rho, rootRot, ref ctx, 0f));
@@ -6656,7 +6664,17 @@ namespace Vortex_FS20.FCS
 						}
 						FcsMode mSave = Mode;
 						Mode = stovlCtolMode;
+						ctolQTurnFF = 0f;
+						if (Plugin.StovlCtolNoseHold && !ctolGroundHold)
+						{
+							// theta' = q cos(phi) - r sin(phi) = 0: q = r tan(phi); inside the law, so the AoA envelope and the rate
+							// budget bound it as any other rate command
+							float phR = phi * 0.0174532924f;
+							float cPh = Mathf.Cos(phR);
+							ctolQTurnFF = omega.z * 57.29578f * Mathf.Sin(phR) / (((cPh >= 0f) ? 1f : -1f) * Mathf.Max(Mathf.Abs(cPh), 0.17364818f));
+						}
 						PitchLaw(num, vc);
+						ctolQTurnFF = 0f;
 						LateralLaw(num);
 						Mode = mSave;
 						cQ = ctolGroundHold ? 0f : qT;
@@ -6675,10 +6693,11 @@ namespace Vortex_FS20.FCS
 						float wC = Mathf.Clamp01(stovl.CtolW);
 						qT = ctolGroundHold ? 0f : Mathf.Lerp(qT, cQ + stovl.ctolQAoA, wC);
 						qCmd = qT;
-						float cPl = Mathf.Clamp(cP, stovl.ctolPLo, stovl.ctolPHi);
+						float cPt = cP + stovl.ctolPTurn;
+						float cPl = Mathf.Clamp(cPt, stovl.ctolPLo, stovl.ctolPHi);
 						pCmd = Mathf.Lerp(pCmd, cPl, wC);
 						rCmd = Mathf.Lerp(rCmd, cR, wC);
-						pDotFF = Mathf.Lerp(pDotFF, (cPl != cP) ? 0f : cPd, wC);
+						pDotFF = Mathf.Lerp(pDotFF, (cPl != cPt) ? 0f : cPd, wC);
 						rDotFF = Mathf.Lerp(rDotFF, cRd, wC);
 						unload = cUnload && wC > 0.5f;
 						prot = cProt && wC > 0.5f;
@@ -8511,6 +8530,137 @@ namespace Vortex_FS20.FCS
 			return tdLimit;
 		}
 
+		// Vortex 0.5.16 (StovlSmoothTouchdown; Tom, 19 Nov: the jet comes down as fast as the gear survives and bounces: "it
+		// slows down just right enough that the contact is smooth ... model based, like weight and available authority"): the
+		// highest sink rate (m/s) at which no wheel that has touched leaves the ground again. The whole jet is dropped on its
+		// legs in heave and pitch (the two mains together, the nose leg; the game's leg force max(0, springRate x compression +
+		// dampingRate x closing speed)) from the hover's pitch attitude, each leg starting from the compression it has standing
+		// still, with the thrust carrying the weight at contact and spooling down as in the gear-break model (the game's 1 s
+		// lag, to ~7 %). The springs alone would throw a jet that weighs nothing at contact straight back up; what keeps it
+		// down is the damping and the weight coming onto the wheels as the thrust decays, and how much of that there is in the
+		// ~0.4 s the rebound takes depends on the mass on each leg: so the limit moves with the weight and the CG. Bench plant,
+		// 13.8 t: no wheel off at 2.0 m/s, a 2 mm hop at 2.5, 0.24 m at the 5 m/s it landed at before.
+		// Recomputed with the gear-break limit (mass 1 %) and when the pitch the jet stands at on its wheels moves 0.5 deg.
+		private float tdSmooth;
+
+		private float tdSmoothMass = -1f;
+
+		private float tdSmoothPitch = -99f;
+
+		// the pitch attitude (deg) the jet stands at on its wheels (learned at rest; 0 until then)
+		private float tdGroundPitch;
+
+		private bool tdGroundSeen;
+
+		private float TouchdownSmoothLimit()
+		{
+			if (tdSmoothMass > 0f && Mathf.Abs(mass - tdSmoothMass) < 0.01f * tdSmoothMass && Mathf.Abs(tdGroundPitch - tdSmoothPitch) < 0.5f)
+			{
+				return tdSmooth;
+			}
+			tdSmoothMass = mass;
+			tdSmoothPitch = tdGroundPitch;
+			tdSmooth = 0f;
+			Transform root = ((Component)(object)ac).transform;
+			// legs by longitudinal arm from the CG (m, + forward): the mains (the legs behind the CG) as one, the rest as the nose
+			float kM = 0f, cM = 0f, zM = 0f, kN = 0f, cN = 0f, zN = 0f;
+			foreach (LandingGear g in gears)
+			{
+				if ((UnityEngine.Object)(object)g == null)
+				{
+					continue;
+				}
+				float k = Acc.LG_spring(g);
+				float c = Acc.LG_damping(g);
+				if (k <= 1f)
+				{
+					continue;
+				}
+				float z = root.InverseTransformDirection(((Component)(object)g).transform.position - cg).z;
+				if (z < 0f)
+				{
+					zM = (zM * kM + z * k) / (kM + k);
+					kM += k;
+					cM += c;
+				}
+				else
+				{
+					zN = (zN * kN + z * k) / (kN + k);
+					kN += k;
+					cN += c;
+				}
+			}
+			float iP = Ia[1, 1];
+			if (kM <= 1f || kN <= 1f || zN - zM < 0.5f || iP <= 1f || mass < 1000f)
+			{
+				return 0f;
+			}
+			float w = mass * 9.81f;
+			float nN = w * (0f - zM) / (zN - zM);
+			float xsM = (w - nN) / kM;
+			float xsN = nN / kN;
+			float phi0 = (Plugin.StovlHoverAttitude - tdGroundPitch) * 0.0174532924f;
+			float lo = 0.2f;
+			float hi = 15f;
+			for (int it = 0; it < 14; it++)
+			{
+				float v = 0.5f * (lo + hi);
+				if (TouchdownHops(v, mass, iP, kM, cM, zM, xsM, kN, cN, zN, xsN, phi0))
+				{
+					hi = v;
+				}
+				else
+				{
+					lo = v;
+				}
+			}
+			tdSmooth = lo;
+			Plugin.Log.LogInfo($"Vortex FCS STOVL: smooth-touchdown sink rate {tdSmooth:F2} m/s at {mass:F0} kg (no wheel leaves the ground again; standing pitch {tdGroundPitch:F1} deg).");
+			return tdSmooth;
+		}
+
+		// the drop: y = CG height above where it stands at rest (m), ph = pitch above the standing attitude (rad). True when a
+		// leg that has been on the ground comes off it again (2 ms steps, 3 s).
+		private static bool TouchdownHops(float v, float m, float iP, float kM, float cM, float zM, float xsM, float kN, float cN, float zN, float xsN, float ph0)
+		{
+			float ph = ph0;
+			float y = Mathf.Max(xsM - zM * ph, xsN - zN * ph);
+			float yd = 0f - v;
+			float phd = 0f;
+			bool onM = false;
+			bool onN = false;
+			const float h = 0.002f;
+			for (int n = 0; n < 1500; n++)
+			{
+				float thrust = 0.07f + 0.93f * Mathf.Exp(-0.002f * (float)n);
+				float xM = xsM - (y + zM * ph);
+				float xN = xsN - (y + zN * ph);
+				float fM = (xM > 0f) ? Mathf.Max(0f, kM * xM - cM * (yd + zM * phd)) : 0f;
+				float fN = (xN > 0f) ? Mathf.Max(0f, kN * xN - cN * (yd + zN * phd)) : 0f;
+				if (xM > 0f)
+				{
+					onM = true;
+				}
+				else if (onM && xM < -0.001f)
+				{
+					return true;
+				}
+				if (xN > 0f)
+				{
+					onN = true;
+				}
+				else if (onN && xN < -0.001f)
+				{
+					return true;
+				}
+				yd += ((fM + fN) / m - 9.81f * (1f - thrust)) * h;
+				phd += (fM * zM + fN * zN) / iP * h;
+				y += yd * h;
+				ph += phd * h;
+			}
+			return false;
+		}
+
 		// sink rate at which a spring-damper leg under mass m (and its weight less the spooling-down thrust) first compresses to
 		// x (bisection on a 2 ms drop sim)
 		private static float DropLimit(float m, float k, float c, float x)
@@ -8545,6 +8695,13 @@ namespace Vortex_FS20.FCS
 
 		private void StovlLaw(float dt, ControlInputs inp, Rigidbody rb, Transform tr, Vector3 acc, bool wow, float rho, bool ctolOn = false, float qCtol = 0f)
 		{
+			// (Vortex 0.5.16: the pitch the jet stands at on its wheels, for the smooth-touchdown model)
+			if (wow && rb.velocity.sqrMagnitude < 1f)
+			{
+				float pg = Mathf.Asin(Mathf.Clamp(tr.forward.y, -1f, 1f)) * 57.29578f;
+				tdGroundPitch = tdGroundSeen ? (tdGroundPitch + (pg - tdGroundPitch) * (dt / (1f + dt))) : pg;
+				tdGroundSeen = true;
+			}
 			StovlSystem.LawIn li = new StovlSystem.LawIn
 			{
 				dt = dt,
@@ -8573,7 +8730,8 @@ namespace Vortex_FS20.FCS
 				rollFull = StovlRollFull(),
 				radarAlt = ac.radarAlt,
 				touchdownMax = TouchdownSinkLimit(),
-				slipStiff = slipStiffDbg,
+				touchdownSmooth = Plugin.StovlSmoothTouchdown ? TouchdownSmoothLimit() : 0f,
+				slipStiff = (Plugin.StovlStiffDynScale && slipStiffQ > 1f) ? (slipStiffDbg * rho * tas * tas / slipStiffQ) : slipStiffDbg,
 				qCtol = qCtol,
 				ctolOn = ctolOn
 			};
@@ -8917,11 +9075,11 @@ namespace Vortex_FS20.FCS
 				{
 					gInt = Mathf.MoveTowards(gInt, 0f, 10f * dt);
 				}
-				qRaw = num17 * num9;
+				qRaw = num17 * num9 + ctolQTurnFF;
 			}
 			else
 			{
-				qRaw = sp * (isAI ? Mathf.Min(qB, AIStickRate()) : qB);
+				qRaw = sp * (isAI ? Mathf.Min(qB, AIStickRate()) : qB) + ctolQTurnFF;
 				hiRate = false;
 				floatOn = false;
 				shapeInit = false;
@@ -12469,7 +12627,7 @@ namespace Vortex_FS20.FCS
 				w.Write("," + surface.name + "_cmd," + surface.name + "_now," + surface.name + "_aoaNow," + surface.name + "_aoaCmd");
 			}
 			// Vortex 0.1.0: STOVL columns
-			w.Write(",stovlState,stovlLaw,swivel,doors,swivelTgt,thrOut,thrIn,gs,vs,gsCmd,hdotCmd,aDesH,aDesV,thetaRef,alphaRef,phiCmd,thrustReq,lamV,lamT,fanIn,postIn,yawIn,ctolW,ctolFpKN,ctolS,stAYaw,stYawLim,stTiltRateA,stTiltRate,stTiltRateU,stAStop,stTrcVmax,stLamL,stLamB,stWz,stTiltPitchA,stKBank,stUFwd,stVSide,stPhiTrc,stGovLam,stAH,stFwdCap,stPsiRate,stOrigin,stVane,stVaneNow,stPir,stPirLim,stFreeRollMax,stFreeBankLim");
+			w.Write(",stovlState,stovlLaw,swivel,doors,swivelTgt,thrOut,thrIn,gs,vs,gsCmd,hdotCmd,aDesH,aDesV,thetaRef,alphaRef,phiCmd,thrustReq,lamV,lamT,fanIn,postIn,yawIn,ctolW,ctolFpKN,ctolS,stAYaw,stYawLim,stTiltRateA,stTiltRate,stTiltRateU,stAStop,stTrcVmax,stLamL,stLamB,stWz,stTiltPitchA,stKBank,stUFwd,stVSide,stPhiTrc,stGovLam,stAH,stFwdCap,stPsiRate,stOrigin,stVane,stVaneNow,stPir,stPirLim,stFreeRollMax,stFreeBankLim,stTw,stTwMan,stFloor,stWing,stHInt,stALag,stGLift");
 			w.WriteLine();
 		}
 
@@ -12612,10 +12770,14 @@ namespace Vortex_FS20.FCS
 				r.Add(",{0:F2},{1:F1}", S.dbgPir, S.dbgPirSlipLim);
 				// Vortex 0.5.7: Stability Assist off: the stick's full roll rate and the bank limit (0 / 0 when not in freestyle)
 				r.Add(",{0:F1},{1:F1}", S.freestyle ? S.dbgFreeRollMax : 0f, S.freestyle ? S.dbgFreeBankLim : 0f);
+				// Vortex 0.5.17: the speed floor and the budget's terms (hover T/W, x cos(manoeuvring tilt), floor m/s, the wing's
+				// lift m/s^2, the height loop's bias integral m/s^2, the budget's thrust-lag reserve m/s^2, the lift the tilts are
+				// converted on m/s^2)
+				r.Add(",{0:F3},{1:F3},{2:F2},{3:F3},{4:F3},{5:F3},{6:F2}", Mathf.Min(9.99f, S.dbgTwHover), Mathf.Min(9.99f, S.dbgTwMan), S.dbgVMinFloor, S.dbgWingF, S.dbgHInt, S.dbgALag, S.dbgGLift);
 			}
 			else
 			{
-				r.Add(",0,0,0,0,0,-1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0");
+				r.Add(",0,0,0,0,0,-1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0");
 			}
 			return r;
 		}

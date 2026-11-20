@@ -10,7 +10,7 @@ namespace Vortex_FS20.FCS
 	[BepInDependency(DevGuid, BepInDependency.DependencyFlags.SoftDependency)]
 	public class FcsStandalonePlugin : BaseUnityPlugin
 	{
-		public const string Version = "0.5.14";
+		public const string Version = "0.6.2";
 
 		// the dev/debug unlock: a separate, empty plugin DLL. When it is loaded (soft dependency, so before this one),
 		// every setting other than the player ones is bound to its config file and shows in the ConfigurationManager
@@ -126,6 +126,39 @@ namespace Vortex_FS20.FCS
 			return k.MainKey != UnityEngine.KeyCode.None && UnityEngine.Input.GetKey(k.MainKey);
 		}
 
+		// Vortex 0.5.16: the caution box (CautionBox): the cautions' owners are asked once a frame, after the game's own HUD
+		// has been updated, and the box is placed under the game's message line. The player's own jet only.
+		private bool cautionWarned;
+
+		private void LateUpdate()
+		{
+			try
+			{
+				bool low = false;
+				bool lowM = false;
+				Aircraft pa = SceneSingleton<CombatHUD>.i?.aircraft;
+				if ((UnityEngine.Object)(object)pa != null && Registry.IsF22(pa))
+				{
+					FcsController c = Registry.Find(pa);
+					StovlSystem s = c?.stovl;
+					low = s != null && c.Engaged && !c.Failed && s.CautionLowTw;
+					lowM = s != null && c.Engaged && !c.Failed && s.CautionLowMargin;
+				}
+				CautionBox.Set("lowtw", StovlSystem.CautionLowTwText, low);
+				// Vortex 0.5.20: hover allowed with less than the manoeuvring margin
+				CautionBox.Set("lowmargin", StovlSystem.CautionLowMarginText, lowM);
+				CautionBox.Tick();
+			}
+			catch (System.Exception exC)
+			{
+				if (!cautionWarned)
+				{
+					cautionWarned = true;
+					Logger.LogWarning("Vortex FCS: caution box: " + exC.Message);
+				}
+			}
+		}
+
 		private void Update()
 		{
 			MpPolicy.Tick();
@@ -137,6 +170,8 @@ namespace Vortex_FS20.FCS
 				if (!ReferenceEquals(mis, lastMission))
 				{
 					lastMission = mis;
+					// Vortex 0.5.16: no caution carried into a new mission
+					CautionBox.ClearAll();
 					// Vortex 0.5.8: and the pirouette key back to the setting
 					Plugin.PirouetteKeyOn = false;
 					pirKeyDown = false;
@@ -160,7 +195,7 @@ namespace Vortex_FS20.FCS
 				if (Plugin.cShipRelKey != null && Plugin.cShipRelKey.Value.MainKey != UnityEngine.KeyCode.None && KeyDown(Plugin.cShipRelKey.Value))
 				{
 					Plugin.ToggleShipRelative();
-					string msg = Plugin.StovlShipRelative ? "STOVL SPEED: SHIP RELATIVE" : "STOVL SPEED: GROUND";
+					string msg = Plugin.StovlShipRelative ? "STOVL SPD: SHIP REL" : "STOVL SPD: GND";
 					Logger.LogInfo("Vortex FCS: " + msg);
 					Aircraft pa = SceneSingleton<CombatHUD>.i?.aircraft;
 					if ((UnityEngine.Object)(object)pa != null)
@@ -197,7 +232,7 @@ namespace Vortex_FS20.FCS
 					}
 					if ((Plugin.StovlPedalPirouette != Plugin.PirouetteKeyOn) != was)
 					{
-						string msg = (Plugin.StovlPedalPirouette != Plugin.PirouetteKeyOn) ? "STOVL PEDAL: PIROUETTE" : "STOVL PEDAL: COORDINATED";
+						string msg = (Plugin.StovlPedalPirouette != Plugin.PirouetteKeyOn) ? "STOVL PEDAL: PIROUETTE" : "STOVL PEDAL: COORD";
 						Logger.LogInfo("Vortex FCS: " + msg);
 						Aircraft pa = SceneSingleton<CombatHUD>.i?.aircraft;
 						if ((UnityEngine.Object)(object)pa != null)

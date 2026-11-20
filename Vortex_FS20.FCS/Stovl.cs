@@ -374,12 +374,39 @@ namespace Vortex_FS20.FCS
 		// Vortex 0.3.9: the pedal's full yaw rate this tick (deg/s, telemetry stYawLim)
 		public float dbgYawLim;
 
-		private float YawRateMax(float aYaw)
+		// the braking envelope's sink rate at a height left h: v tau + (v^2 - vTd^2) / 2a = h
+		private static float VStopAt(float h, float vTd, float a, float tau)
 		{
-			float r = (Plugin.StovlYawStopTime > 0f) ? (aYaw * Plugin.StovlYawStopTime) : Plugin.StovlHoverYawRate;
+			return a * (0f - tau + Mathf.Sqrt(tau * tau + 2f * (h + vTd * vTd / (2f * a)) / a));
+		}
+
+		private float YawRateMax(float aYaw, float dt)
+		{
+			// Vortex 0.5.18 (StovlYawRateMeanAuthority; Tom, 20 Nov: "the control surfaces wobbles when i do turning in stovl"):
+			// the yaw authority the pedal's full rate is built on is its mean over the stop time the rate is sized for
+			// (StovlYawStopTime, low-pass at that time constant), not this tick's. The authority is taken over the effectors'
+			// windows and tables, which move with what the roll axis is doing with the same surfaces and posts; the full-pedal
+			// turn rate, and with it the turn's bank target (g tan(bank) = u x turn rate), moved with it: deeper bank -> roll
+			// effectors further out -> less yaw authority -> less turn rate -> less bank target, 2 ticks later, at ~2.6 deg of
+			// bank target per deg of bank. That closed a loop through the bank loop: Tom's 00:49 log, 48 kt, 12.55 t, full
+			// pedal: 1.2-1.5 Hz of roll for 25 s, the roll posts end to end and the surfaces +-21 deg, the yaw authority
+			// estimate +-5 % in step with it. A stop sized for StovlYawStopTime spends that long on the authority, so its mean
+			// over that time is the one that counts; the yaw loop's own stops still use the authority now.
+			float aUse = aYaw;
+			if (Plugin.StovlYawRateMeanAuthority && Plugin.StovlYawStopTime > 0f)
+			{
+				aYawRateF = aYawRateInit ? (aYawRateF + (aYaw - aYawRateF) * (dt / (Plugin.StovlYawStopTime + dt))) : aYaw;
+				aYawRateInit = true;
+				aUse = aYawRateF;
+			}
+			float r = (Plugin.StovlYawStopTime > 0f) ? (aUse * Plugin.StovlYawStopTime) : Plugin.StovlHoverYawRate;
 			dbgYawLim = r;
 			return r;
 		}
+
+		private float aYawRateF;
+
+		private bool aYawRateInit;
 
 		public float dbgAUp;
 
@@ -470,6 +497,34 @@ namespace Vortex_FS20.FCS
 		internal static float AeroShare1 = 0.35438f;
 
 		// the speed (m/s, in the plane of symmetry) at which the wing alone carries the jet at StovlWingAoAMax
+		// Vortex 0.5.26: the share of the lift the thrust carries, which is what a pitch tilt of the jet tilts: the wing's share
+		// as the attitude reference uses it (wWing), the released stick's CTOL attitude hold (wCtolBlend, last tick) and the
+		// CTOL blend (wC), under which the CTOL pitch law flies the nose
+		private float TiltShare(ref LawIn I, float vSym, float wC)
+		{
+			float wWing = Plugin.StovlPhysicsBlends ? Smooth(WingShare0, WingShare1, vSym / WingBorneSpeed(ref I)) : Smooth(15f, 45f, vSym);
+			return (1f - wWing) * (1f - Mathf.Clamp01(wCtolBlend)) * (1f - Mathf.Clamp01(wC));
+		}
+
+		// Vortex 0.6.1 (StovlEngineCondition; Tom, 20 Nov: "i tried to slam the jet on to the ground to damage the engine, so
+		// thrust reduces after every impact. And when the jet doesnt have enough thrust to lift off anynorem, where is the low
+		// hvr t/w warning"; "no need to tell that the engine is damaged, just use the same dialog"): the share of the engine's
+		// static thrust it can still reach at its damage state, by the game's own engine law: the reachable RPM is minRPM +
+		// (maxRPM - minRPM)(0.5 condition + 0.5) and the dry thrust clamp01((RPM - 0.85 minRPM) / (maxRPM - minRPM)) of the
+		// static thrust (full down to condition 0.85 on a 1000-3000 RPM engine). Every figure of what the lift system can
+		// make (the hover T/W behind the caution and the speed floor, the thrust budgets, the fit's ceiling) took the static
+		// thrust, so a damaged engine read as healthy: his 13:02 log, the hover T/W stayed 1.30-1.40 after the impacts while
+		// the jet sat on the runway at 88 % throttle with T/W 0.43-0.67 and never lifted off.
+		private float ThrustReach()
+		{
+			if (!Plugin.StovlEngineCondition || hw == null)
+			{
+				return 1f;
+			}
+			float span = Mathf.Max(1f, hw.MaxRpm - hw.MinRpm);
+			return Mathf.Clamp01((hw.MinRpm + span * (0.5f * Mathf.Clamp01(hw.Condition) + 0.5f) - 0.85f * hw.MinRpm) / span);
+		}
+
 		private float WingBorneSpeed(ref LawIn I)
 		{
 			return Mathf.Sqrt(2f * Mathf.Max(1f, I.mass) * 9.81f / Mathf.Max(0.001f, I.rho * sCLa * Mathf.Max(1f, Plugin.StovlWingAoAMax) * 0.0174532924f));
@@ -514,9 +569,16 @@ namespace Vortex_FS20.FCS
 
 		private const float StopLag = 1f;
 
+		private float stopLagNow = 1f;
+
+		internal static bool VhTdLagFromTau = true;
+
 		private float aStop = 1f;
 
 		private float vStopNow = 99f;
+
+		// Vortex 0.5.25 (StovlSharedBudget): the height left above the touchdown envelope's end point, this tick
+		private float hRoomNow = 999f;
 
 		private float vTdNow = 5f;
 
@@ -586,6 +648,19 @@ namespace Vortex_FS20.FCS
 			sCLa = Mathf.Max(1f, s);
 		}
 
+		// Vortex 0.5.17: the wing's lift area at zero AoA as last measured in flight (sCL0F), kept for the session so the speed
+		// floor and its MIN readout have it on the runway before the next take-off. The airfoils cannot give it: the Vortex's
+		// lifting parts have symmetric foils at zero incidence (0 m^2 from them), while the flight measurement reads 44 m^2
+		// (flaps and the other lifting parts included; bench, Stock 13.68 t, 140 kt), so the floor's wing model comes from the
+		// measurement or not at all.
+		private static float sCL0Carry;
+
+		private static bool sCL0Known;
+
+		public float dbgSCL0 => wingSeen ? sCL0F : (sCL0Known ? sCL0Carry : 0f);
+
+		public float dbgSCL0Known => sCL0Known ? 1f : 0f;
+
 		private static float Smooth(float a, float b, float x)
 		{
 			float t = Mathf.Clamp01((x - a) / (b - a));
@@ -631,12 +706,12 @@ namespace Vortex_FS20.FCS
 					if (auto && !onGround && ias > Plugin.StovlAutoStovlIas / 3.6f)
 					{
 						selected = true;
-						Say($"STOVL <b>armed</b>: converts below {Plugin.StovlAutoStovlIas:F0} km/h");
+						Say($"AUTO STOVL ARMED: < {Plugin.StovlAutoStovlIas:F0} KM/H");
 						return;
 					}
 					if (ias > Plugin.StovlConversionMaxIas / 3.6f)
 					{
-						Say($"STOVL conversion <b>inhibited</b> above {Plugin.StovlConversionMaxIas:F0} km/h");
+						Say($"STOVL INHIB: IAS > {Plugin.StovlConversionMaxIas:F0} KM/H");
 						return;
 					}
 					// 0.1.8: and under the true airspeed the STOVL laws can hold (their speed cap, 11 m/s under the game's swivel
@@ -644,14 +719,14 @@ namespace Vortex_FS20.FCS
 					// would be thrown out of at once (6 km: 460 km/h IAS is ~610 TAS, the cut-off 500)
 					if (hw != null && hw.Valid && !onGround && hw.AircraftSpeed > hw.MaxSwivelAirspeed - 11f)
 					{
-						Say($"STOVL conversion <b>inhibited</b>: true airspeed over {(hw.MaxSwivelAirspeed - 11f) * 3.6f:F0} km/h");
+						Say($"STOVL INHIB: TAS > {(hw.MaxSwivelAirspeed - 11f) * 3.6f:F0} KM/H");
 						return;
 					}
 					// 0.3.5 (Tom, 17 Nov): not above the STOVL mode's AoA limit (StovlAoALimit, 24 deg): the limit takes over at the
 					// request, so a conversion from a higher AoA would step the limit down under the jet
 					if (!onGround && Plugin.StovlAoALimit > 0f && Mathf.Abs(alphaNow) > Plugin.StovlAoALimit)
 					{
-						Say($"STOVL conversion <b>inhibited</b>: AoA over {Plugin.StovlAoALimit:F0} deg");
+						Say($"STOVL INHIB: AOA > {Plugin.StovlAoALimit:F0}\u00b0");
 						return;
 					}
 					// 0.2.8 conversion guard (Tom, 17 Nov 2026): a jet already too lopsided for the hover is not converted. The roll
@@ -668,7 +743,7 @@ namespace Vortex_FS20.FCS
 					asymWarnT = -100f;
 					selected = true;
 					state = StovlState.Converting;
-					Say("STOVL conversion: doors opening");
+					Say("STOVL CONV - DOORS OPENING");
 					return;
 				}
 				if (auto)
@@ -684,20 +759,20 @@ namespace Vortex_FS20.FCS
 			case StovlState.Off:
 			case StovlState.Reconverting:
 				selected = false;
-				Say("STOVL <b>off</b>");
+				Say("AUTO STOVL DISARMED");
 				break;
 			case StovlState.Converting:
 			case StovlState.On:
 				// (on the wheels it is always allowed: back to CTOL for the taxi after a vertical landing)
 				if (ias < Plugin.StovlReconversionMinIas / 3.6f && !onGround)
 				{
-					Say($"Reconversion <b>inhibited</b> below {Plugin.StovlReconversionMinIas:F0} km/h");
+					Say($"CTOL INHIB: IAS < {Plugin.StovlReconversionMinIas:F0} KM/H");
 					return;
 				}
 				selected = false;
 				leverZero = leverSeen <= Plugin.StovlAftDetent + Plugin.StovlDetentWidth + 0.005f;
 				state = StovlState.Reconverting;
-				Say("Reconversion to CTOL");
+				Say("CTOL CONV");
 				break;
 			}
 		}
@@ -750,7 +825,7 @@ namespace Vortex_FS20.FCS
 			{
 				autoConverting = false;
 				state = StovlState.Reconverting;
-				Say("STOVL conversion called off: manoeuvring (STOVL stays armed)");
+				Say("STOVL CONV ABORT: MNVR - STOVL ARMED");
 			}
 			bool wantCtol = state == StovlState.On && !onGround && ias >= Plugin.StovlAutoCtolIas / 3.6f;
 			bool wantStovl = (state == StovlState.Off || state == StovlState.Reconverting) && ias <= Plugin.StovlAutoStovlIas / 3.6f && calm && (onGround || Plugin.StovlAoALimit <= 0f || Mathf.Abs(alphaNow) <= Plugin.StovlAoALimit);
@@ -760,14 +835,14 @@ namespace Vortex_FS20.FCS
 			{
 				autoCtolT = 0f;
 				state = StovlState.Reconverting;
-				Say($"CTOL above {Plugin.StovlAutoCtolIas:F0} km/h (STOVL stays armed)");
+				Say($"AUTO CTOL CONV > {Plugin.StovlAutoCtolIas:F0} KM/H - STOVL ARMED");
 			}
 			else if (autoStovlT >= 2f && !ConversionUnsafe(false))
 			{
 				autoStovlT = 0f;
 				autoConverting = true;
 				state = StovlState.Converting;
-				Say($"STOVL conversion below {Plugin.StovlAutoStovlIas:F0} km/h: doors opening");
+				Say("AUTO STOVL CONV - DOORS OPENING");
 			}
 		}
 
@@ -954,14 +1029,19 @@ namespace Vortex_FS20.FCS
 				state = (hw != null && hw.Doors > 0.5f) ? StovlState.On : StovlState.Off;
 				throttleOverride = false;
 				lawInit = false;
+				lowTw = false;
+				lowTwSaid = false;
+				lowMargin = false;
+				hoverKg = 0f;
 				return;
 			}
 			AutoTransition(dt);
+			HoverTwTick(dt);
 			if (state == StovlState.On && hw.AircraftSpeed > hw.MaxSwivelAirspeed - 0.5f)
 			{
 				// the game swings the nozzle aft above this speed whatever it is told: hand back to the CTOL laws
 				state = StovlState.Reconverting;
-				Say("Overspeed: reconversion to CTOL");
+				Say("OVSPD - CTOL CONV");
 			}
 			switch (state)
 			{
@@ -986,7 +1066,7 @@ namespace Vortex_FS20.FCS
 					state = StovlState.On;
 					thrLatchPending = true;
 					leverPark = true;
-					Say("<b>STOVL</b> mode");
+					Say("STOVL MODE");
 				}
 				break;
 			case StovlState.Reconverting:
@@ -996,7 +1076,7 @@ namespace Vortex_FS20.FCS
 				if (hw.Doors <= 0.001f && hw.Swivel <= 0.001f)
 				{
 					state = StovlState.Off;
-					Say("<b>CTOL</b> mode");
+					Say("CTOL MODE");
 				}
 				break;
 			}
@@ -1065,6 +1145,10 @@ namespace Vortex_FS20.FCS
 
 			// the highest touchdown sink rate the gear survives (m/s; FcsController.TouchdownSinkLimit)
 			public float touchdownMax;
+
+			// Vortex 0.5.16: the highest touchdown sink rate at which no leg leaves the ground again (m/s;
+			// FcsController.TouchdownSmoothLimit; 0 = not known)
+			public float touchdownSmooth;
 
 			// 0.2.1: the airframe's directional stiffness (deg/s^2 of restoring yaw per deg of sideslip, the controller's slip probe)
 			public float slipStiff;
@@ -1372,7 +1456,7 @@ namespace Vortex_FS20.FCS
 			float lPrev = 0f;
 			for (int k = 0; k < n; k++)
 			{
-				float aT = VhFwdCapThrust * Mathf.Max(1f, (hw.MaxThrust - hw.ParasiticLoss * gS[k]) * altF) / m;
+				float aT = VhFwdCapThrust * Mathf.Max(1f, (hw.MaxThrust - hw.ParasiticLoss * gS[k]) * altF * ThrustReach()) / m;
 				float l = aT * gLift[k];
 				float f = aT * gDir[k].z;
 				if (l >= lb)
@@ -1400,7 +1484,7 @@ namespace Vortex_FS20.FCS
 			float lPrev = 0f;
 			for (int k = 0; k < n; k++)
 			{
-				float aT = VhFwdCapThrust * Mathf.Max(1f, (hw.MaxThrust - hw.ParasiticLoss * gS[k] * vDrive[j]) * altF) / m;
+				float aT = VhFwdCapThrust * Mathf.Max(1f, (hw.MaxThrust - hw.ParasiticLoss * gS[k] * vDrive[j]) * altF * ThrustReach()) / m;
 				float l = aT * g2Lift[k * NV + j];
 				float f = aT * g2Dir[k * NV + j].z;
 				if (l >= lb)
@@ -1459,6 +1543,233 @@ namespace Vortex_FS20.FCS
 
 		public float dbgVShare => vShare;
 
+		// Vortex 0.5.16 (StovlLiftCorrect): the vertical lift per unit mass the tilt conversions are worked out on this tick
+		// (g + the vertical acceleration asked of the thrust; 9.81 with the switch off, on the wheels and outside the hover
+		// regime), and the measured vertical acceleration (0.1 s low-pass) for the bench's comparison of the two sources
+		private float gLiftNow = 9.81f;
+
+		private float accYF;
+
+		// (bench: what the bank is planned on: 0 = the weight, 1 = the lift, 2 = the lift when it is above the weight;
+		// what a bank is taken to give: 0 = the weight, 1 = the lift asked, 2 = the lift measured)
+		internal static int VhLiftPlan = 2;
+
+		internal static int VhLiftGive = 2;
+
+		internal static bool VhLiftYaw = true;
+
+		// (the nose's rate has been cut for a lift deficit since the pedal was let go)
+		private bool liftYawCut;
+
+		public float dbgGLift => gLiftNow;
+
+		// Vortex 0.5.16: bench / telemetry (the wing's measured lift per unit mass in the budget, the hover T/W, the lever's
+		// minimum-speed floor in m/s, the touchdown sink rate the descent is slowed to)
+		public float dbgWingLift;
+
+		public float dbgTwHover => twF;
+
+		public float dbgVMinFloor;
+
+		public float dbgVTouch;
+
+		// Vortex 0.5.17 (Tom, 20 Nov: "also the cockpit hud, can you add min airspeed to the throttle scale side"): the minimum
+		// airspeed the throttle gauges show while too heavy to hover (knots, 0 = none)
+		// (shown only once the wing has been measured, this flight or an earlier one this session: without it the floor counts
+		// the wing's lift at the hover attitude alone, sCLa x 3 deg, and on the runway read 85.6 kt for the 49.5 kt it holds in
+		// the air; bench, Stock 13.68 t)
+		public float MinAirspeedKt => (CautionLowTw && dbgVMinFloor > 0f && (wingSeen || sCL0Known)) ? (dbgVMinFloor * 1.944f) : 0f;
+
+		// Vortex 0.5.16 (StovlWingLiftBudget): the wing's lift, world-vertical, per unit mass (m/s^2; measured, 0.3 s low-pass,
+		// 0 .. what the wing at StovlWingAoAMax makes at this airspeed), and the wing's lift area at zero AoA (m^2, learned from
+		// the same measurement: lift / dynamic pressure - sCLa x AoA; 1 s low-pass) for the speed floor
+		private float aWingF;
+
+		private float sCL0F;
+
+		private bool wingSeen;
+
+		// Vortex 0.5.16 (StovlMinSpeedFloor): the hover T/W as the laws count it (1 s low-pass), the too-heavy-to-hover latch
+		// (on under 1.00, off over 1.02) and whether the floor holds the lever this tick (HUD)
+		private float twF = 99f;
+
+		// (Vortex 0.5.17: the hover T/W x cos(StovlManeuverTilt))
+		private float twM = 99f;
+
+		public float dbgTwMan => twM;
+
+		public float dbgHInt => hInt;
+
+		public float dbgWingF => aWingF;
+
+		private bool lowTw;
+
+		private bool lowMarginSaid;
+
+		private bool lowTwSaid;
+
+		private bool floorHolds;
+
+		private const float LowTwOn = 1f;
+
+		// (bench: the floor's lift reserve as a share of the weight; -1 = LowTwOff - 1, as built)
+		internal static float VhFloorReserve = -1f;
+
+		internal static bool VhLagGov = false;
+
+		internal static bool VhFloorBias = true;
+
+		public float dbgRateBud;
+
+		public float dbgALag;
+
+		private const float LowTwOff = 1.02f;
+
+		// the caution LOW HVR T/W: STO/RVL ONLY is up (the game plugin shows it in the caution box)
+		public bool CautionLowTw => owns && lowTw && Plugin.StovlMinSpeedFloor && (state == StovlState.Converting || state == StovlState.On);
+
+		public const string CautionLowTwText = "LOW HVR T/W: STO/RVL ONLY";
+
+		// Vortex 0.5.20 (StovlLowMarginHover): the jet hovers but cannot tilt its lift StovlManeuverTilt and still hold its
+		// height: the caution LOW HVR T/W: REDUCED MNVR (no speed floor; the translation budget is what the thrust leaves)
+		private bool lowMargin;
+
+		public bool CautionLowMargin => owns && lowMargin && !lowTw && Plugin.StovlMinSpeedFloor && (state == StovlState.Converting || state == StovlState.On);
+
+		// (0.5.21, Tom: "the mnvr ltd is a bit confusing, especially ltd"; his pick)
+		public const string CautionLowMarginText = "LOW HVR T/W: REDUCED MNVR";
+
+		// Vortex 0.5.16: the hover T/W as the laws count it: 95 % of full dry thrust (the rest is kept for the yaw nozzle and the
+		// roll posts, as every budget) with the nozzle at its hover trim and the lift fan balancing it, yaw nozzle centred,
+		// along the jet's up axis, over the weight. From the lift system's geometry, so it is known before the fan runs (at
+		// the conversion request). 99 = not known.
+		public float HoverTW(float mass)
+		{
+			if (hw == null || !hw.Valid || mass < 1000f || !NozzleAt(sHov, 0f, out var d, out var pn))
+			{
+				return 99f;
+			}
+			Transform ft = hw.FanThrustT;
+			// (the nozzle's direction in the jet's plane of symmetry: whatever yaw the nozzle has at the moment is not part of
+			// what the hover can make. Without this a pedal input, or the nose wheel's steering on the runway, read as 5 % less
+			// hover thrust on the bench and would have set the caution and the speed floor off in a hover.)
+			{
+				Vector3 rt = ((Component)(object)ac).transform.right;
+				Vector3 ds = d - rt * Vector3.Dot(d, rt);
+				if (ds.sqrMagnitude > 0.25f)
+				{
+					d = ds.normalized;
+				}
+			}
+			bool vn = VanesOn && lawInit;
+			Vector3 fd = (ft == null) ? Vector3.zero : (vn ? FanDirAt(vHov) : ft.forward);
+			// (the fan's balancing force as FanForceAt works it out, but with the doors taken as open: at the conversion request
+			// they are still shut)
+			float fk = 0f;
+			if (ft != null)
+			{
+				Transform root = ((Component)(object)ac).transform;
+				Vector3 cgw = hw.CenterOfMass;
+				Vector3 m4 = root.InverseTransformDirection(Vector3.Cross(d, -(pn - cgw)));
+				Vector3 m6 = root.InverseTransformDirection(Vector3.Cross(fd, -(ft.position - cgw)));
+				fk = (Mathf.Abs(m6.x) < 1E-06f) ? 0f : Mathf.Max(0f, (0f - m4.x) / m6.x);
+			}
+			float tMx = Mathf.Max(1f, (hw.MaxThrust - hw.ParasiticLoss * sHov * (vn ? VaneDrive(vHov) : 1f)) * Mathf.Max(0.05f, hw.AltFactor));
+			return 0.95f * tMx * Mathf.Max(0f, Vector3.Dot(d + fd * fk, ((Component)(object)ac).transform.up)) / (mass * 9.81f);
+		}
+
+		// (called every tick from PreTick while the FCS owns the lift system)
+		// The geometry behind HoverTW is right when the nozzle is where it is asked about or fully aft: links of the swivel
+		// duct that are not the bearings themselves are read as they stand. Bench: asked from CTOL (nozzle aft) and in STOVL
+		// flight it agrees with the hover's own figure within 0.6 %; on the wheels in STOVL mode, with the nozzle at its ground
+		// position past the hover trim, and while it swings there, it reads 4 % low. So the figure is taken in CTOL (what the
+		// conversion request sees) and in the air in STOVL mode with the nozzle within 0.02 of its hover trim, as a mass the
+		// lift system can hover (hoverKg, 1 s low-pass), and kept otherwise (converting, on the wheels, the nozzle
+		// further aft at speed); the T/W is that over the mass of the moment.
+		private float hoverKg;
+
+		private void HoverTwTick(float dt)
+		{
+			bool stovlish = state == StovlState.Converting || state == StovlState.On;
+			float m = Mathf.Max(1000f, massSeen);
+			float tw = HoverTW(m);
+			if (tw < 90f)
+			{
+				if (hoverKg <= 0f)
+				{
+					hoverKg = tw * m;
+				}
+				else if (state == StovlState.Off || (state == StovlState.On && lawInit && airNow && !onGround && Mathf.Abs(hw.Swivel - sHov) < 0.02f))
+				{
+					hoverKg += (tw * m - hoverKg) * (dt / (1f + dt));
+				}
+			}
+			// (0.6.1: the engine's damage applied to the held figure live: the geometry is what is held on the wheels, the
+			// thrust the engine can still reach is not)
+			twF = (hoverKg > 0f) ? (hoverKg * ThrustReach() / m) : 99f;
+			// Vortex 0.5.17 (StovlManeuverTilt): the hover T/W that counts is the part of the lift left vertical with the lift
+			// tilted by the manoeuvring margin, T/W x cos(tilt): what the jet can hold its height on while it manoeuvres.
+			twM = twF * Mathf.Cos(Plugin.StovlManeuverTilt * 0.0174532924f);
+			if (!stovlish || hoverKg <= 0f)
+			{
+				lowTw = false;
+				lowTwSaid = false;
+				lowMargin = false;
+				lowMarginSaid = false;
+				return;
+			}
+			// Vortex 0.5.20 (StovlLowMarginHover; Tom, 20 Nov, 15.15 t: "i cant go vertical?", then: hover allowed with a
+			// warning). Too heavy to hover (the speed floor) is the hover not holding its height at all: hover T/W under 1.00 on
+			// the law's scale (cleared over 1.02). The speed floor, where it holds, is still sized for the full manoeuvring tilt
+			// (twM), so at the floor the jet has StovlManeuverTilt of margin. Between the two - the hover holds, but not with
+			// that tilt - the jet hovers and goes vertical, with the caution LOW HVR T/W: REDUCED MNVR; its translation budget is
+			// what the thrust leaves, as everywhere. 0.5.17-0.5.19 put the floor on at twM < 1: his 01:25 log, 15.15 t, hover
+			// T/W 1.054 (18.4 deg of tilt for the 20 asked): the jet lifted off vertically at 3.3 m/s and was sent forward to
+			// the 34 kt floor with the lever at the zero-speed detent.
+			// (Vortex 0.5.21: "holds its height" counts the climb reserve the speed floor itself keeps, LowTwOff - 1 = 2 % of
+			// the weight: on under 1.02, off over 1.04. Tom's 01:50 log, 15.85 t, hover T/W 1.005: the caution said the jet
+			// could hover, but with 0.05 m/s^2 to climb on it could not lift off; at 1.02 a vertical take-off climbs at ~1.1 m/s,
+			// bench)
+			float twFloor = Plugin.StovlLowMarginHover ? (twF - (LowTwOff - 1f)) : twM;
+			if (twFloor < LowTwOn)
+			{
+				lowTw = true;
+			}
+			else if (twFloor > LowTwOff)
+			{
+				lowTw = false;
+				lowTwSaid = false;
+			}
+			if (Plugin.StovlLowMarginHover && twM < LowTwOn)
+			{
+				lowMargin = true;
+			}
+			else if (!Plugin.StovlLowMarginHover || twM > LowTwOff)
+			{
+				lowMargin = false;
+				lowMarginSaid = false;
+			}
+			// (with the caution box switched off: once, as an ordinary message)
+			if (lowTw && !lowTwSaid && Plugin.StovlMinSpeedFloor)
+			{
+				lowTwSaid = true;
+				Plugin.Log.LogInfo(Plugin.StovlLowMarginHover ? $"Vortex FCS STOVL: too heavy to hover: hover T/W {twF:F3} at {massSeen:F0} kg (speed floor, sized for {Plugin.StovlManeuverTilt:F0} deg of manoeuvring tilt)." : $"Vortex FCS STOVL: too heavy to hover with {Plugin.StovlManeuverTilt:F0} deg of manoeuvring tilt: hover T/W {twF:F3} (x cos(tilt) = {twM:F3}) at {massSeen:F0} kg.");
+				if (!Plugin.CautionBoxOn)
+				{
+					Say(CautionLowTwText);
+				}
+			}
+			else if (lowMargin && !lowTw && !lowMarginSaid && Plugin.StovlMinSpeedFloor)
+			{
+				lowMarginSaid = true;
+				Plugin.Log.LogInfo($"Vortex FCS STOVL: hover with less than {Plugin.StovlManeuverTilt:F0} deg of manoeuvring tilt: hover T/W {twF:F3} (holds height up to {Mathf.Acos(Mathf.Min(1f, 1f / Mathf.Max(1f, twF))) * 57.29578f:F1} deg of tilt) at {massSeen:F0} kg.");
+				if (!Plugin.CautionBoxOn)
+				{
+					Say(CautionLowMarginText);
+				}
+			}
+		}
+
 		private float GovLambda(bool inc, float rateDeg)
 		{
 			if (!VhGovern || (!inc && !VhGovernDown))
@@ -1512,7 +1823,7 @@ namespace Vortex_FS20.FCS
 		{
 			const float wy = 1f;
 			float wz = fitWz;
-			float tMx = Mathf.Max(1f, (hw.MaxThrust - hw.ParasiticLoss * s * drive) * altF);
+			float tMx = Mathf.Max(1f, (hw.MaxThrust - hw.ParasiticLoss * s * drive) * altF * ThrustReach());
 			float tMn = idleRatio * tMx;
 			float den = wy * g.y * g.y + wz * g.z * g.z;
 			T = (den > 1E-06f) ? ((wy * fB.y * g.y + wz * fB.z * g.z) / den) : 0f;
@@ -1665,7 +1976,7 @@ namespace Vortex_FS20.FCS
 			// Vortex 0.3.9 (Tom, 17 Nov: no fixed yaw-rate limit): the pedal's full rate is what the yaw axis can start and stop
 			// within StovlYawStopTime at its authority now (aYaw, the ramp below), so it follows mass, fuel, stores and the lift
 			// system's thrust; StovlYawStopTime is set so a clean jet with full fuel in the hover gets the old 30 deg/s
-			float yawRateMax = YawRateMax(aYaw);
+			float yawRateMax = YawRateMax(aYaw, dt);
 			float pedalTgt = (Mathf.Abs(I.sy) < 0.05f) ? 0f : (I.sy * yawRateMax);
 			psiDotPedal = Mathf.MoveTowards(psiDotPedal, pedalTgt, aYaw * dt);
 			float psiDot;
@@ -1708,9 +2019,41 @@ namespace Vortex_FS20.FCS
 			// (the pedal is a body yaw rate while held, the heading hold's Euler rate when released)
 			bool pedalHeld = Mathf.Abs(I.sy) >= 0.05f;
 			float psiDotE = pedalHeld ? 0f : psiDot;
+			// the wing-borne share (10-25 m/s on the reference jet): where the airspeed means something the roll is about the air
+			// velocity, and (0.6.0) so are the pitch and the yaw
+			Vector3 vAirF = I.vel - I.wind;
+			Vector3 rgtB = root.right;
+			float vSymF = (vAirF - rgtB * Vector3.Dot(vAirF, rgtB)).magnitude;
+			float wVv = Plugin.StovlPhysicsBlends ? Smooth(AeroShare0, AeroShare1, vSymF / WingBorneSpeed(ref I)) : Smooth(10f, 25f, vSymF);
+			float aR = Mathf.Clamp(I.alpha, -30f, 60f) * 0.0174532924f;
 			float p = phiDot - psiDotE * sth;
 			float q = thetaDot * cph + psiDotE * cth * sph;
 			float r = (0f - thetaDot) * sph + psiDotE * cth * cph;
+			// Vortex 0.6.0 (StovlFreeWingAxes; Tom, 20 Nov: "i departed at the end of the log, why wasnt it rolling around the
+			// velocity vectpr"): the stick and the released heading hold were Euler rates at every speed, so at a bank a pitch
+			// command was partly a body yaw: q = thetaDot cos(bank), r = -thetaDot sin(bank). Right in the hover (nose up against
+			// the horizon); at speed it yaws the nose across the air. His 12:13 log, 293.6-296.5 s: Stability Assist off at
+			// 50 m/s, -55 deg of bank, full aft stick: 17 deg/s of pitch and +24.6 deg/s of yaw to the right in a left bank (the
+			// turn needed -6 to -9), sideslip -1 -> -63 deg in 2.5 s and the jet departed. Now, by the same wing-borne share as
+			// the velocity-vector roll: the stick is a body pitch rate (the released stick's attitude hold keeps its pitch part,
+			// thetaDot cos(bank), which brings the attitude back at any bank), the heading hold becomes a sideslip hold (the
+			// heading follows the bank), and the yaw rate is the one that keeps the sideslip still: with no side force at zero
+			// sideslip, beta' = p sin(AoA) - r cos(AoA) + g cos(theta) sin(bank) / V = 0, the p sin(AoA) part being the
+			// velocity-vector roll's (below), so r = g cos(theta) sin(bank) / (V cos(AoA)); with the pedal released the
+			// sideslip is brought to zero on top of it by the heading hold's own stop (a fast roll the yaw cannot follow leaves
+			// some, which the zero-rate rule alone would keep: bench, full-stick roll at 45 deg of pitch, 10 deg left). The pedal
+			// stays a body yaw rate.
+			if (Plugin.StovlFreeWingAxes && wVv > 0f)
+			{
+				bool stickHeld = Mathf.Abs(I.sp) >= 0.05f;
+				float qW = stickHeld ? thetaDot : (thetaDot * cph);
+				float vW = Mathf.Max(5f, vAirF.magnitude);
+				float rB = pedalHeld ? 0f : Stop(I.beta, 2.5f, aYaw, 20f);
+				float rW = (9.81f * cth * sph / vW * 57.29578f + rB) / Mathf.Max(0.2f, Mathf.Cos(aR));
+				p = Mathf.Lerp(p, phiDot, wVv);
+				q = Mathf.Lerp(q, qW, wVv);
+				r = Mathf.Lerp(r, rW, wVv);
+			}
 			if (pedalHeld)
 			{
 				r += psiDotPedal;
@@ -1718,17 +2061,10 @@ namespace Vortex_FS20.FCS
 			// MPO axis rule (single-engine 3D TVC: the nozzle's pitch swivel and yaw bearing): velocity-vector roll with a separate
 			// body yaw on the pedal. The roll is about the air velocity wherever the airspeed means something (p cos(AoA) on body
 			// roll + p sin(AoA) on body yaw), faded to the body roll under 10-25 m/s (in the hover a bank is a bank)
+			if (wVv > 0f)
 			{
-				Vector3 vAirF = I.vel - I.wind;
-				Vector3 rgtB = root.right;
-				float vSymF = (vAirF - rgtB * Vector3.Dot(vAirF, rgtB)).magnitude;
-				float wVv = Plugin.StovlPhysicsBlends ? Smooth(AeroShare0, AeroShare1, vSymF / WingBorneSpeed(ref I)) : Smooth(10f, 25f, vSymF);
-				if (wVv > 0f)
-				{
-					float aR = Mathf.Clamp(I.alpha, -30f, 60f) * 0.0174532924f;
-					p += wVv * phiDot * (Mathf.Cos(aR) - 1f);
-					r += wVv * phiDot * Mathf.Sin(aR);
-				}
+				p += wVv * phiDot * (Mathf.Cos(aR) - 1f);
+				r += wVv * phiDot * Mathf.Sin(aR);
 			}
 			if (rateFFInit)
 			{
@@ -1922,6 +2258,9 @@ namespace Vortex_FS20.FCS
 		// propulsion carries the load (deg/s), and the path held with the stick released
 		public float ctolQAoA;
 
+		// Vortex 0.5.22 (StovlCtolNoseHold): the body roll rate that keeps the bank in a turn with the nose up (deg/s)
+		public float ctolPTurn;
+
 		// the roll-rate window (deg/s) that keeps the CTOL roll command inside the bank the lift can hold
 		public float ctolPLo = -999f;
 
@@ -2082,7 +2421,7 @@ namespace Vortex_FS20.FCS
 			{
 				return false;
 			}
-			float tMx = Mathf.Max(1f, (hw.MaxThrust - hw.ParasiticLoss * sHov) * Mathf.Max(0.05f, hw.AltFactor));
+			float tMx = Mathf.Max(1f, (hw.MaxThrust - hw.ParasiticLoss * sHov) * Mathf.Max(0.05f, hw.AltFactor) * ThrustReach());
 			float ratio = Mathf.Min(mass * 9.81f / gy, tMx) / Mathf.Max(1f, hw.MaxThrust);
 			float mPost = 0f;
 			for (int i = 0; i < hw.Posts; i++)
@@ -2193,6 +2532,7 @@ namespace Vortex_FS20.FCS
 				// (0.2.9: no CTOL blend in freestyle: the pilot has the throttle and nozzle there already)
 				CtolW = 0f;
 				ctolQAoA = 0f;
+				ctolPTurn = 0f;
 				FreeLaw(ref I);
 				return;
 			}
@@ -2260,6 +2600,7 @@ namespace Vortex_FS20.FCS
 				aTrcStopInit = false;
 				aTiltInit = false;
 				aTiltFullInit = false;
+				aYawRateInit = false;
 				fitWz = 0.25f;
 				hRef = I.pos.y;
 				hHold = false;
@@ -2328,6 +2669,33 @@ namespace Vortex_FS20.FCS
 			float lamY = 1f - Smooth(15.4f + sh, 20.6f + sh, uAbs);
 			float lamTrc = 1f - Smooth(7.7f + sh, 15.4f + sh, uAbs);
 			float lamRoll = Smooth(51.4f, 66.9f, vSym);
+			// Vortex 0.5.16 (StovlLiftCorrect; Tom, 19 Nov, on the 0.80 m/s of side speed at the pivot after a 30 kt pedal turn
+			// with a climb: "is it a physical trade off or control laws"). Control law: every conversion between a tilt and the
+			// acceleration it gives took the lift as the weight (atan(a / g), g tan(tilt)). The lift is the weight only while the
+			// vertical speed is steady: stopping a 6 m/s climb the thrust is cut and the lift is ~60-70 % of the weight, so the
+			// bank the law had planned on pulled that much less sideways and the flight path lagged the nose (bench K30C:
+			// 0.82 m/s at the pivot 1.35 s after the release; 0.31 while the climb accelerates, the same error the other way;
+			// 0.09 with no climb). Two lifts are used, where the thrust holds the height (lamV):
+			//   gL (what a tilt is planned on): the lift when it is above the weight, g + the vertical acceleration the height
+			//     loop asks of the thrust (last tick's demand: it leads the lift by the thrust's lag, as the tilt's target leads
+			//     the tilt), else the weight. A surplus is shallow (the spare thrust at most) and lasts seconds; a deficit is deep
+			//     (gravity) and over in ~1.5 s, before a bank could be added for it. With the bank planned on a deficit too
+			//     (the first form benched), the bank rose from 21 to 29 deg while the climb was stopped, was still there when
+			//     the lift came back, and the side speed after the release went from 0.82 to 1.34 m/s.
+			//   gGive (what the bank that is there gives): the lift measured (g + the vertical acceleration, 0.1 s low-pass),
+			//     above or below the weight. In a deficit the nose's rate is cut to that share (the yaw law below).
+			// A model correction: no gain, and g with no vertical acceleration.
+			accYF += (I.accel.y - accYF) * (dt / (0.1f + dt));
+			float gL = g;
+			float gGive = g;
+			if (Plugin.StovlLiftCorrect && !I.wow)
+			{
+				float gAsk = Mathf.Clamp(g + lamV * aVhLast, 0.5f * g, 1.5f * g);
+				float gMeas = Mathf.Clamp(g + lamV * accYF, 0.5f * g, 1.5f * g);
+				gL = (VhLiftPlan == 1) ? gAsk : ((VhLiftPlan == 2) ? Mathf.Max(g, gAsk) : ((VhLiftPlan == 3) ? Mathf.Max(g, gMeas) : g));
+				gGive = (VhLiftGive == 1) ? gAsk : ((VhLiftGive == 2) ? gMeas : g);
+			}
+			gLiftNow = gGive;
 			// 0.2.9: the CTOL blend's weight (see VhCtolBlend); the controller runs the CTOL laws from the next tick on
 			float wC = VhCtolBlend ? Smooth(VhCtolV0 + sh, VhCtolV1 + sh, vSym) : 0f;
 			CtolW = wC;
@@ -2338,6 +2706,7 @@ namespace Vortex_FS20.FCS
 			if (wC <= 0f)
 			{
 				ctolQAoA = 0f;
+				ctolPTurn = 0f;
 				ctolPathInit = false;
 				dbgCtolFp = 0f;
 			}
@@ -2376,7 +2745,7 @@ namespace Vortex_FS20.FCS
 				float capDrive = vnOn ? VaneDrive(vHov) : 1f;
 				float fkV = vnOn ? FanForceAt(1f, dV, pV, 0f, fanCapDir) : FanForce(1f, dV, pV, 0f);
 				Vector3 gV = dV + ((hw.FanThrustT != null) ? (fanCapDir * fkV) : Vector3.zero);
-				float tMx = Mathf.Max(1f, (hw.MaxThrust - hw.ParasiticLoss * sCap * capDrive) * Mathf.Max(0.05f, hw.AltFactor));
+				float tMx = Mathf.Max(1f, (hw.MaxThrust - hw.ParasiticLoss * sCap * capDrive) * Mathf.Max(0.05f, hw.AltFactor) * ThrustReach());
 				float fvMax = 0.95f * tMx * Mathf.Max(0f, gV.y);
 				fvMaxNow = fvMax;
 				aFullDry = tMx / Mathf.Max(1f, I.mass);
@@ -2419,7 +2788,7 @@ namespace Vortex_FS20.FCS
 				// that (they slow down by themselves as the thrust nears full dry and never ask for lift it cannot make in
 				// time); going back toward level is free. The same headroom, as an acceleration, bounds what a roll post or a
 				// fan pitch burst may take: a step loss d met by lift rising at r costs about (2/3) d^3 / r^2 of height.
-				float tMxNow = Mathf.Max(1f, (hw.MaxThrust - hw.ParasiticLoss * hw.Swivel * vnDriveNow) * Mathf.Max(0.05f, hw.AltFactor));
+				float tMxNow = Mathf.Max(1f, (hw.MaxThrust - hw.ParasiticLoss * hw.Swivel * vnDriveNow) * Mathf.Max(0.05f, hw.AltFactor) * ThrustReach());
 				float ratioReq = Mathf.Clamp(dbgThrustReq / tMxNow, 0.05f, 1f);
 				// Vortex 0.5.14 (StovlClimbShare): the governor keeps a tilt from taking lift the thrust cannot make up in time,
 				// so the jet does not sink. Lift that is going into a stick climb's acceleration is lift in hand for that: a
@@ -2428,7 +2797,7 @@ namespace Vortex_FS20.FCS
 				// request the climb itself has run up to the limit. 0.2.8-0.5.13: with a climb asked the request sat at the
 				// limit, the headroom was zero and no tilt came in until the climb had its rate.
 				float ratioGov = ratioReq;
-				if (Plugin.StovlClimbShare && govVAsk > govVFloor)
+				if ((Plugin.StovlClimbShare || Plugin.StovlSharedBudget) && govVAsk > govVFloor)
 				{
 					ratioGov = Mathf.Clamp(ratioReq * (9.81f + govVFloor) / (9.81f + govVAsk), 0.05f, 1f);
 				}
@@ -2461,19 +2830,68 @@ namespace Vortex_FS20.FCS
 			}
 			float hAgl = I.radarAlt - raGround;
 			float vTd = Mathf.Clamp(I.touchdownMax, 0.5f, Plugin.StovlSinkRate);
+			// Vortex 0.5.16 (StovlSmoothTouchdown; Tom, 19 Nov: "the jet will go as fast as long as the gears wont snap, but the
+			// jet still bounces. So right before touch down, it slows down just right enough that the contact is smooth, but dont
+			// be too conservative or too relaxed ... model based, like weight and available authority"). The descent is slowed
+			// to the highest sink rate at which the gear does not throw the jet back into the air (touchdownSmooth: the legs'
+			// springs and dampers under the mass each carries, with the engine spooling down from the hover's thrust; the
+			// controller's drop model), no more than the gear-break limit above. The braking envelope below does the rest as
+			// before: it starts the slow-down where the spare lift (70 % of it, after the loop's lag) can still make it, so a
+			// heavy jet starts higher, and ends it 0.3 m above the wheels' contact height.
+			if (Plugin.StovlSmoothTouchdown && I.touchdownSmooth > 0f)
+			{
+				vTd = Mathf.Min(vTd, Mathf.Max(0.5f, I.touchdownSmooth));
+			}
+			dbgVTouch = vTd;
 			vTdNow = vTd;
 			// braking envelope: v*tau + (v^2 - vTd^2) / 2a = height left, with 70 % of the spare lift (the rest covers the loop
 			// error, gusts and the mass estimate) and tau 1 s for the engine spool and the height loop; the envelope's own
 			// deceleration is fed forward below so the sink follows it down rather than trailing it
 			aStop = Mathf.Max(0.3f, 0.7f * aUpAvail);
 			float hRoom = Mathf.Max(0f, hAgl - 0.3f);
-			float vStop = aStop * (-StopLag + Mathf.Sqrt(StopLag * StopLag + 2f * (hRoom + vTd * vTd / (2f * aStop)) / aStop));
+			hRoomNow = hRoom;
+			// (Vortex 0.5.16: with the smooth touchdown the envelope's lag is the vertical axis's own thrust response time,
+			// tauV, not the fixed 1 s: the jet follows the envelope within ~0.02 m/s on the bench (its deceleration is fed
+			// forward), and with 1 s the last 2 m were flown at the touchdown rate)
+			stopLagNow = (Plugin.StovlSmoothTouchdown && VhTdLagFromTau) ? Mathf.Min(StopLag, tauV) : StopLag;
+			float vStop = VStopAt(hRoom, vTd, aStop, stopLagNow);
+			// Vortex 0.5.19 (StovlTouchdownAccel; Tom, 20 Nov, on the smooth touchdown: "It worked but not 100%, sometimes it
+			// will still bounce, check it if it is the fcs or the physical limit"): the envelope took the descent as steady when
+			// the braking starts. Pushed down from a climb, the jet is still accelerating downward when it reaches the envelope,
+			// and the thrust has to take that acceleration out before it can brake: his 01:19 log, the three landings that
+			// bounced entered the envelope at -3.5, -1.4 and -2.8 m/s^2, thrust at full for ~1.35 s, contact at 2.67 / 2.16 /
+			// 2.41 m/s for the 1.91 the gear takes; the five that entered at a steady -5 m/s touched at 1.45-1.57. The thrust is
+			// the same either way (the jet had it): the braking started too late. In the envelope's own terms (the thrust's
+			// response time tau, then aStop) a downward acceleration aDn takes tau x aDn / aStop longer to undo, during which
+			// the jet keeps gaining sink at aDn: the sink allowed now is the one that, after that time, is on the envelope.
+			// aDn is the measured vertical acceleration (0.1 s low-pass); on the envelope the jet is braking, aDn is 0 and
+			// nothing changes.
+			if (Plugin.StovlTouchdownAccel && Plugin.StovlSmoothTouchdown)
+			{
+				float aDn = Mathf.Max(0f, 0f - accYF);
+				if (aDn > 0.05f && !I.wow)
+				{
+					float tauD = stopLagNow * aDn / aStop;
+					float vAcc = vStop;
+					for (int it = 0; it < 4; it++)
+					{
+						float h2 = Mathf.Max(0f, hRoom - vAcc * tauD - 0.5f * aDn * tauD * tauD);
+						vAcc = Mathf.Max(0f, VStopAt(h2, vTd, aStop, stopLagNow) - aDn * tauD);
+					}
+					vStop = vAcc;
+				}
+			}
 			float sinkLim = Mathf.Max(vTd, Mathf.Min(Plugin.StovlSinkRate, vStop));
 			vStopNow = vStop;
 			// 0.2.6: vertical first. The vertical axis's capacity is the lift along the body's up axis (the translation tilt
 			// yields to it), not the world-vertical part left at the present tilt (aUpAvail), which a translation had taken.
 			float aUpBody = fLiftBodyMax / Mathf.Max(1f, I.mass) - 9.81f;
-			float climbLim = Plugin.StovlClimbRate * Mathf.Clamp01(aUpBody / 1f);
+			// Vortex 0.5.21: on the wheels, the climb a vertical take-off may ask is what the lift system gives with the nozzle
+			// at its hover trim (the hover T/W, twF), where it will be once off the ground; the live figure has the nozzle at its
+			// ground position past the trim and reads ~4 % low there (HoverTW's note), which at a hover T/W near 1 gave no climb
+			// at all: Tom's 01:50 log, 15.85 t, hover T/W 1.005, full aft stick on the wheels, climb asked 0, thrust at idle.
+			float aUpClimb = (I.wow && Plugin.StovlLowMarginHover && twF < 90f) ? Mathf.Max(aUpBody, (twF - 1f) * 9.81f) : aUpBody;
+			float climbLim = Plugin.StovlClimbRate * Mathf.Clamp01(aUpClimb / 1f);
 			// 0.2.6: the translation budget (side and fore-aft together): everything the full-dry lift can give horizontally
 			// once the vertical axis has what it asks, a_h = sqrt(a_max^2 - (g + a_v)^2), with a_v = the height loop's demand
 			// (a climb command or a sink stop takes it back from the translation) + the lift the thrust lag loses while the
@@ -2598,12 +3016,53 @@ namespace Vortex_FS20.FCS
 				float gSide = Vector3.Dot(gW, rgt);
 				gLift[k] = Mathf.Sqrt(gB.y * gB.y + gSide * gSide);
 			}
+			// Vortex 0.5.16 (StovlWingLiftBudget; Tom, 19 Nov: "also the wing lift term, would it be beneficial to that?"). The
+			// budget below took the weight as the thrust's to carry at every speed. At 30 kt the wing already carries ~3.9 kN of
+			// this jet's weight and at 45 kt ~9.7 kN (bench, 13.8 t), so the budget thought the thrust had less to spare than it
+			// has. The wing's lift is measured, as the transition does (mass x (acceleration - gravity) - the propulsive force):
+			// its world-vertical part per unit mass, 0.3 s low-pass (the low-pass the fit's vertical request has), never below
+			// zero (a wing pushing down does not shrink the budget under 0.5.15's) and never more than the wing at
+			// StovlWingAoAMax makes at this airspeed, so in the hover it is zero and nothing moves. The same measurement gives
+			// the wing's lift area at zero AoA (lift normal to the flight path / dynamic pressure, less sCLa x AoA; learned
+			// where the wing could carry 2 % of the weight or more and the AoA is inside StovlWingAoAMax), which the speed floor
+			// uses for the lift at the hover attitude.
+			float aWing = 0f;
+			{
+				float qW = 0.5f * I.rho * vSym * vSym;
+				float capW = qW * sCLa * Plugin.StovlWingAoAMax * 0.0174532924f / Mathf.Max(1f, I.mass);
+				float aWnow = 0f;
+				if (fPropInit && !I.wow)
+				{
+					Vector3 fA = I.mass * (I.accel - Physics.gravity) - fPropF;
+					aWnow = Mathf.Clamp(fA.y / Mathf.Max(1f, I.mass), 0f, capW);
+					// (and only within 1 deg of the attitude the laws hold in level flight, thetaRefF: with the nose up for a stop
+					// the lift does not follow sCLa, the learned area moved with the tilt, the floor with it and the lever's
+					// speed command with the floor: bench, 16.5 t, the stop onto the floor hunted +-2 kt for 10 s)
+					if (capW >= 0.02f * 9.81f && Mathf.Abs(I.alpha) <= Plugin.StovlWingAoAMax && Mathf.Abs(I.alpha - thetaRefF) <= 1f && vA > 1f)
+					{
+						Vector3 tW = vAir / vA;
+						Vector3 nW = up - tW * Vector3.Dot(up, tW);
+						float lN = (nW.sqrMagnitude > 0.25f) ? Vector3.Dot(fA, nW.normalized) : fA.y;
+						float s0 = lN / Mathf.Max(1f, qW) - sCLa * I.alpha * 0.0174532924f;
+						sCL0F = wingSeen ? (sCL0F + (s0 - sCL0F) * (dt / (1f + dt))) : s0;
+						wingSeen = true;
+						sCL0Carry = sCL0F;
+						sCL0Known = true;
+					}
+				}
+				aWingF = I.wow ? 0f : Mathf.Clamp(aWingF + (aWnow - aWingF) * (dt / (0.3f + dt)), 0f, capW);
+				dbgWingLift = aWingF;
+				if (Plugin.StovlWingLiftBudget)
+				{
+					aWing = aWingF;
+				}
+			}
 			float aVbud;
 			float aH;
 			float aHask;
 			float aHlevel;
 			{
-				float g0 = 9.81f;
+				float g0 = 9.81f - aWing;
 				float aMaxT = fLiftBodyMax / Mathf.Max(1f, I.mass);
 				// 0.2.8: what the vertical axis keeps back from the translation is its command's demand (a climb on the stick, a
 				// sink being stopped) and the lift to fly a height deficit back, not the loop's whole demand of the moment: that
@@ -2624,7 +3083,7 @@ namespace Vortex_FS20.FCS
 				// (below), so the thrust in hand is there for the tilt. What is not
 				// shared: stopping a sink, holding a height and flying a height deficit back (the floor) keep their demand
 				// whole. Last tick's asks; the reserve for the thrust lag (aLag) is worked out on the shared demand.
-				bool shareOn = Plugin.StovlClimbShare && aVcLast > 0f && !I.wow;
+				bool shareOn = (Plugin.StovlClimbShare || Plugin.StovlSharedBudget) && aVcLast > 0f && !I.wow;
 				float aVfP = Mathf.Max(0f, aVfLast);
 				if (shareOn)
 				{
@@ -2634,7 +3093,14 @@ namespace Vortex_FS20.FCS
 				float tl = Mathf.Atan2(aH0, g0 + aVres);
 				// (0.4.0: at the faster axis's tilt rate)
 				float rateBud = TiltRate(Mathf.Max(aTiltRoll, aTiltPitch), Plugin.StovlTrcBankRate);
+				// (bench experiment: the reserve counted at the rate the governor lets a tilt come in at that tilt)
+				if (VhLagGov && VhGovern)
+				{
+					rateBud = Mathf.Min(rateBud, Mathf.Max(0.5f, tiltBudget / Mathf.Max(0.01f, Mathf.Tan(tl)) * 57.29578f));
+				}
+				dbgRateBud = rateBud;
 				float aLag = g0 * Mathf.Tan(tl) / Mathf.Max(0.2f, Mathf.Cos(tl)) * rateBud * 0.0174532924f * tauV;
+				dbgALag = aLag;
 				vShare = 1f;
 				float hShare = 0f;
 				if (shareOn)
@@ -2683,9 +3149,54 @@ namespace Vortex_FS20.FCS
 				// the forward scale over 10 % (~6 kt), 0.1.x 30 kt over 25 %
 				gsCmd = -((ta - tw) - thrE) / Mathf.Max(0.01f, ta - tw) * (Plugin.StovlBackGroundSpeed / 1.944f);
 			}
+			// Vortex 0.5.16 (StovlMinSpeedFloor; Tom, 19 Nov, on the real jet's "performance deficit protection": "or it blocks the
+			// jet at airspeeds that relies more on the t/w that it doesnt have to be on air"). Too heavy to hover (lowTw: the
+			// hover T/W under 1.00, held until it is over 1.02), STOVL mode stays available, and the lever's deceleration
+			// stops at the lowest airspeed at which the thrust and the wing together carry the weight with 2 % of it in hand
+			// (the margin at which the latch lets go, so the floor is zero when the caution clears): thrust carries T/W of
+			// the weight, the wing has to carry the rest, 1/2 rho V^2 x its lift area at the hover attitude (the area at zero
+			// AoA learned above + sCLa x the level-flight attitude; before the wing has been measured, sCLa x the attitude
+			// alone, which puts the floor on the high side). On airspeed along the nose: the ground-speed command's floor is that less the
+			// headwind. In the air only: on the wheels the lever is the lever (a rolling landing stops, a short take-off
+			// starts from rest).
+			float vFloor = 0f;
+			float uAirF = Vector3.Dot(vAir, hdg);
+			floorHolds = false;
+			// (0.5.17: worked out on the wheels too, for the throttle gauge's MIN readout before a short take-off, which shows it
+			// once the wing's zero-AoA lift has been measured in flight this session; applied in the air only)
+			if (Plugin.StovlMinSpeedFloor && lowTw)
+			{
+				// Vortex 0.5.17 (StovlManeuverTilt; Tom, 20 Nov: "I want the min speed to leave useful maneuvering authority"):
+				// the floor is where the wing takes enough of the weight that the lift can be tilted by the manoeuvring margin
+				// and still hold the height: thrust x cos(tilt) + wing = weight x 1.02. 0.5.16 stopped where thrust + wing just
+				// carried the weight (+2 %): the translation budget there was ~1.25 m/s^2 on the bench (full pedal 3.9 deg/s at
+				// 30 kt) and zero in Tom's 20 Nov log (13.7 t Stock: 0.3 deg/s at 43-47 kt). The height loop's bias integral is
+				// counted as weight: it is what the force model is short by, and the budget pays for it (it is in the vertical
+				// demand), so the floor does too.
+				float lack = 9.81f * (1f + ((VhFloorReserve >= 0f) ? VhFloorReserve : (LowTwOff - 1f)) - twM) + (VhFloorBias ? (lamV * hInt) : 0f);
+				if (lack > 0f)
+				{
+					// (at the pitch attitude the laws hold in level flight at this speed: the hover attitude, more as the wing takes
+					// its share; thetaRefF, without the fore-aft tilt of a stop)
+					float attW = Mathf.Clamp(thetaRefF, Plugin.StovlHoverAttitude, Mathf.Max(Plugin.StovlHoverAttitude, Plugin.StovlWingAoAMax));
+					float areaW = Mathf.Max(1f, (wingSeen ? Mathf.Max(0f, sCL0F) : (sCL0Known ? Mathf.Max(0f, sCL0Carry) : 0f)) + sCLa * attW * 0.0174532924f);
+					vFloor = Mathf.Sqrt(2f * I.mass * lack / (Mathf.Max(0.05f, I.rho) * areaW));
+				}
+				float gsFloor = vFloor - (uAirF - u);
+				if (vFloor > 0f && gsCmd < gsFloor && !I.wow)
+				{
+					gsCmd = gsFloor;
+					floorHolds = slowRegime;
+				}
+			}
+			dbgVMinFloor = vFloor;
 			// 0.1.5: what the lever commands, for the HUD throttle readout (HudThrottle): ground speed in the hover regime
 			// ("0 GS" in the aft detent), hold / accelerate / decelerate at speed
-			if (slowRegime)
+			if (floorHolds)
+			{
+				hudText = "MIN " + Mathf.RoundToInt(vFloor * 1.944f) + " KT";
+			}
+			else if (slowRegime)
 			{
 				hudText = (gsCmd == 0f) ? "0 GS" : ((gsCmd > 0f) ? ("+" + Mathf.RoundToInt(gsCmd * 1.944f) + " KT") : (Mathf.RoundToInt(gsCmd * 1.944f) + " KT"));
 				// Vortex 0.4.1: "SHP" while the speeds are ship-relative (StovlShipRelative, on by default from 0.4.6)
@@ -2799,6 +3310,13 @@ namespace Vortex_FS20.FCS
 			// command is zero, nothing changes. 0.4.7-0.5.5: at 45 kt the pedal was held to ~7.5 deg/s so the bank could bring the
 			// velocity round with the nose.
 			bool pirWant = (Plugin.StovlPedalPirouette != Plugin.PirouetteKeyOn) && !I.wow && lamY > 0.01f && (Mathf.Abs(I.sy) >= 0.05f || (pirOn && Mathf.Abs(psiDotPedal) > 0.5f));
+			// Vortex 0.5.22 (StovlLowTwPedal; Tom, 20 Nov: "for the pirouette logic, block it when the jet cant hover at zero
+			// airspeed"): where the hover cannot hold its height (lowTw, the speed floor's own test) the jet needs its wing, and a
+			// pirouette's sideslip takes the wing's lift and, past the rudders' reach, the yaw authority with it
+			if (Plugin.StovlLowTwPedal && lowTw && !pirOn)
+			{
+				pirWant = false;
+			}
 			pirOn = pirWant;
 			// Vortex 0.5.8 (Tom, 18 Nov: "with the pirouette logic on, no side skid will be corrected when there is yaw input";
 			// on 0.5.6-0.5.7's pirouette, his 18:30 log: after the pedal was let go the jet came level and only "a moment later"
@@ -2829,7 +3347,7 @@ namespace Vortex_FS20.FCS
 			// (0.4.0: the profiles' jerk from each axis's tilt rate)
 			float rateSideP = TiltRate(aTiltRoll, Plugin.StovlTrcBankRate * kRollS);
 			float rateFwdP = TiltRate(aTiltPitch, Plugin.StovlTrcBankRate);
-			float jLat = 9.81f * rateFwdP * 0.0174532924f;
+			float jLat = gL * rateFwdP * 0.0174532924f;
 			// (the bank loop lags the bank target by ~0.4 s (gain 2.5 / s), so the profile leaves room for it: the acceleration
 			// a with a^2 / (2 j) + a tau = |e|; without it a 15 m/s stop ran 1.1 m/s past zero)
 			// Vortex 0.3.9 (Tom, 17 Nov: "reduce the start and braking margin for sideways skid by 20 %"): 0.4 -> 0.32 s
@@ -2843,7 +3361,7 @@ namespace Vortex_FS20.FCS
 			{
 				tauBank = Mathf.Max(tauBank, 1f / BankLoopGain());
 			}
-			float jLatY = (Plugin.StovlTiltStopTime > 0f) ? (9.81f * rateSideP * 0.0174532924f) : (jLat * kRollS);
+			float jLatY = (Plugin.StovlTiltStopTime > 0f) ? (gL * rateSideP * 0.0174532924f) : (jLat * kRollS);
 			float tauBankY = tauBank / Mathf.Max(0.01f, kRollS);
 			float aProf = jLatY * (Mathf.Sqrt(tauBankY * tauBankY + 2f * Mathf.Abs(eV) / Mathf.Max(0.0001f, jLatY)) - tauBankY);
 			float aLatW = Mathf.Sign(eV) * Mathf.Min(Mathf.Abs(eV) / (2f * tauBankY), aProf);
@@ -3003,8 +3521,37 @@ namespace Vortex_FS20.FCS
 				// runway, so with the lever at the stop the engine was throttled back to 0.48-0.62 to hold 6 m/s^2 (10:24 log,
 				// bench S1)
 				float tTop = 1f - 2f * tw;
-				aAcc = (thrE > tc) ? ((thrE <= tTop) ? ((thrE - (tc + tw)) / Mathf.Max(0.01f, tTop - (tc + tw)) * Plugin.StovlAccelMax) : Mathf.Lerp(Plugin.StovlAccelMax, Mathf.Max(Plugin.StovlAccelMax, aFullDry), (thrE - tTop) / Mathf.Max(0.001f, 1f - tTop))) : (0f - Mathf.Clamp01(((tc - tw) - thrE) / Mathf.Max(0.01f, (tc - tw) - (ta + tw))) * Plugin.StovlDecelMax);
+				// Vortex 0.5.26 (StovlLeverStopModel; Tom, 20 Nov: "when i command accel and then right back to deccel, the jet
+				// tends to wiggle for deccel"): the aft detent's "stop as hard as the jet can" is the stop the jet can make, the
+				// fore-aft profile's demand for the zero-ground-speed command inside the same budget the speed command's is (what
+				// aGs is with gsCmd 0), in place of the fixed StovlDecelMax (4 m/s^2). With the fixed value the demand stepped from
+				// 4 to the budget's 7.7 m/s^2 as lamT handed the lever to the speed command (11:36 log, 190.3-192.4 s, 33 -> 28
+				// m/s), and the nose went 7.5 -> 37 deg at up to 11 deg/s after it had come down from the CTOL blend's 10.4.
+				float decMax = Plugin.StovlDecelMax;
+				if (Plugin.StovlLeverStopModel)
+				{
+					float aStopW = Mathf.Min(uAbs / (2f * tauPitch), jU * (Mathf.Sqrt(tauPitch * tauPitch + 2f * uAbs / Mathf.Max(0.01f, jU)) - tauPitch));
+					float aStopN = Mathf.Sqrt(aLatW * aLatW + aStopW * aStopW);
+					decMax = (aStopN > aHv && !I.wow) ? (aStopW * aHv / aStopN) : aStopW;
+				}
+				aAcc = (thrE > tc) ? ((thrE <= tTop) ? ((thrE - (tc + tw)) / Mathf.Max(0.01f, tTop - (tc + tw)) * Plugin.StovlAccelMax) : Mathf.Lerp(Plugin.StovlAccelMax, Mathf.Max(Plugin.StovlAccelMax, aFullDry), (thrE - tTop) / Mathf.Max(0.001f, 1f - tTop))) : (0f - Mathf.Clamp01(((tc - tw) - thrE) / Mathf.Max(0.01f, (tc - tw) - (ta + tw))) * decMax);
 				decelFrac = (thrE > tc) ? 0f : Mathf.Clamp01(((tc - tw) - thrE) / Mathf.Max(0.01f, (tc - tw) - (ta + tw)));
+			}
+			// Vortex 0.5.16 (StovlMinSpeedFloor): where the lever is an acceleration command, its deceleration ends on the floor
+			// by the fore-aft profile's own rule (as the speed command's does)
+			if (vFloor > 0f && lamT < 1f)
+			{
+				float eF = vFloor - uAirF;
+				float aFl = Mathf.Sign(eF) * Mathf.Min(Mathf.Abs(eF) / (2f * tauPitch), jU * (Mathf.Sqrt(tauPitch * tauPitch + 2f * Mathf.Abs(eF) / Mathf.Max(0.01f, jU)) - tauPitch));
+				if (aAcc < aFl)
+				{
+					aAcc = aFl;
+					if (!slowRegime && wC < 0.5f)
+					{
+						floorHolds = true;
+						hudText = "MIN " + Mathf.RoundToInt(vFloor * 1.944f) + " KT";
+					}
+				}
 			}
 			float aLong = Mathf.Lerp(aAcc, aGs, lamT);
 			// speed protection: stay under the game's swivel cut-off
@@ -3138,7 +3685,7 @@ namespace Vortex_FS20.FCS
 			float aEnv = 0f;
 			if (hdot < 0f && hdotCmd <= 0f - sinkLim + 0.01f && vStopNow < Plugin.StovlSinkRate && vStopNow > vTdNow)
 			{
-				aEnv = (0f - hdot) / (StopLag + vStopNow / aStop);
+				aEnv = (0f - hdot) / (stopLagNow + vStopNow / aStop);
 			}
 			// the demand may reach full thrust (aUpAvail keeps 5 % back) and a slow integral takes out the force model's bias
 			// (the roll posts' and the yaw nozzle's losses), frozen at the limits and on the wheels
@@ -3151,12 +3698,48 @@ namespace Vortex_FS20.FCS
 			vGainF = Mathf.MoveTowards(vGainF, holdingNow ? 1f : 0f, dt / 0.5f);
 			float aVhRaw = Mathf.Lerp(kVRateL, kVRate, vGainF) * (hdotCmd - hdot) + aEnv + hInt + hdotFF;
 			float aVh = Mathf.Clamp(aVhRaw, -4f, aVhHi);
-			// Vortex 0.5.14 (StovlClimbShare, see the translation budget): with the stick asking for a climb, the demand is
-			// the floor (what it would be were the command only "do not sink": stopping a sink, the integral) plus the climb's
-			// own acceleration, and that part is what shares the budget with the translation.
+			// Vortex 0.5.25 (StovlSharedBudget; Tom, 20 Nov, on 0.5.24's sink-stop share: "is this an on top fix? i want the fcs
+			// has to share the budget for every axis when needed"; chose to keep the released-stick height hold protected).
+			// One rule for what the vertical axis keeps whole and what it shares, in place of a branch per case (0.5.14: a stick
+			// climb; 0.5.24: a descent's stop). Protected, kept whole: the height hold (released stick holding a height,
+			// including flying a dip or a deficit back), the deceleration the ground needs (the descent brought to the
+			// touchdown rate in the height left above the touchdown envelope; all of it once the sink is at or past what the
+			// envelope allows), the envelope's own deceleration and the integral. Everything else the vertical asks, whatever
+			// asks it (a climb, a commanded sink being eased, a released descent's stop), is one demand on the thrust beside
+			// the translation's: when both together ask for more than the thrust holds, each has the same share of what it
+			// could have alone and may use what the other leaves (ClimbPart). The weight and the thrust-lag reserve stand
+			// before both (the translation budget). On the wheels, and where the vertical gives lift back, nothing is shared.
 			aVcLast = 0f;
 			aVfLast = aVh;
-			if (Plugin.StovlClimbShare && sp >= 0.05f && !I.wow)
+			if (Plugin.StovlSharedBudget)
+			{
+				bool holdingH = hHold && holdDir == 0f && Mathf.Abs(sp) < 0.05f;
+				if (!I.wow && aVh > 0f && !holdingH)
+				{
+					float aTd = 0f;
+					if (hdot < -0.05f)
+					{
+						if (0f - hdot >= vStopNow)
+						{
+							aTd = aVh;
+						}
+						else
+						{
+							float hLeft = Mathf.Max(0.05f, hRoomNow - (0f - hdot) * stopLagNow);
+							aTd = Mathf.Max(0f, (hdot * hdot - vTdNow * vTdNow) / (2f * hLeft));
+						}
+					}
+					float aVf = Mathf.Clamp(aTd + aEnv + hInt, 0f, aVh);
+					if (aVh > aVf)
+					{
+						aVfLast = aVf;
+						aVcLast = aVh - aVf;
+						aVh = aVf + vShare * aVcLast;
+					}
+				}
+			}
+			// (0.5.14-0.5.24, StovlSharedBudget off: only a stick climb shared, above the floor of "do not sink")
+			else if (Plugin.StovlClimbShare && sp >= 0.05f && !I.wow)
 			{
 				float aVf = Mathf.Clamp(Mathf.Lerp(kVRateL, kVRate, vGainF) * (Mathf.Min(hdotCmd, Mathf.Max(0f, hdot)) - hdot) + aEnv + hInt + hdotFF, -4f, aVhHi);
 				if (aVh > aVf)
@@ -3362,7 +3945,7 @@ namespace Vortex_FS20.FCS
 				// pair that leaves the most thrust in hand. The lowest table entry, then one Newton step on the nine costs around
 				// it (the line of equal force runs diagonally through the table, so the two are refined together).
 				float vAct = Mathf.Clamp(hw.VaneNow, vnLo, vnHi);
-				float tFull = Mathf.Max(1f, hw.MaxThrust * altF);
+				float tFull = Mathf.Max(1f, hw.MaxThrust * altF * ThrustReach());
 				int kb = 0;
 				int jb = 0;
 				for (int k = 0; k < nG; k++)
@@ -3371,7 +3954,7 @@ namespace Vortex_FS20.FCS
 					for (int j = 0; j < NV; j++)
 					{
 						float rj = WlsCostD(g2Dir[k * NV + j], fReqB, gS[k], idleRatio, altF, vDrive[j], out float tj);
-						float tMxj = Mathf.Max(1f, (hw.MaxThrust - hw.ParasiticLoss * gS[k] * vDrive[j]) * altF);
+						float tMxj = Mathf.Max(1f, (hw.MaxThrust - hw.ParasiticLoss * gS[k] * vDrive[j]) * altF * ThrustReach());
 						float share = tj / tMxj;
 						float dvn = (vG[j] - vAct) / 90f;
 						float cj = rj + 0.02f * mg * mg * ds * ds + 0.02f * mg * mg * dvn * dvn + VhVaneThrustW * tFull * tFull * share * share;
@@ -3450,7 +4033,7 @@ namespace Vortex_FS20.FCS
 							Vector3 gWb = dA + fd * fkb;
 							float drv = VaneDrive(vb);
 							float rb = WlsCostD(new Vector3(0f, Vector3.Dot(gWb, up), Vector3.Dot(gWb, hdg)), fReqB, sa, idleRatio, altF, drv, out float tb);
-							float shb = tb / Mathf.Max(1f, (hw.MaxThrust - hw.ParasiticLoss * sa * drv) * altF);
+							float shb = tb / Mathf.Max(1f, (hw.MaxThrust - hw.ParasiticLoss * sa * drv) * altF * ThrustReach());
 							float dvb = (vb - vAct) / 90f;
 							fine9[a * 3 + b] = rb + 0.02f * mg * mg * dsa * dsa + 0.02f * mg * mg * dvb * dvb + VhVaneThrustW * tFull * tFull * shb * shb;
 						}
@@ -3523,6 +4106,24 @@ namespace Vortex_FS20.FCS
 					gamHoldC = gam;
 					ctolPathInit = true;
 				}
+				// Vortex 0.5.22 (StovlCtolNoseHold): the pitch rate that keeps the pitch attitude in a banked turn
+				// (theta' = q cos(phi) - r sin(phi) = 0: q = r tan(phi)); the nose and the path are flown at the CTOL law's rate on top
+				// of it, so a released stick holds the attitude in a bank instead of letting the nose fall by r sin(phi)
+				// (Vortex 0.5.22a: the turn's pitch rate, r tan(bank), now goes into the CTOL pitch law ahead of its AoA envelope,
+				// FcsController.ctolQTurnFF, so it is in qCtol here; 0.5.22 added it after the law, past the AoA limit, and a full
+				// pull with full roll at 170 kt asked 120-245 deg/s of pitch at 80 deg of bank: AoA 46 -> 160, departure)
+				ctolPTurn = 0f;
+				if (Plugin.StovlCtolNoseHold && !I.wow)
+				{
+					// the bank with it: with the nose held up in a turn the bank grows by the heading rate x sin(pitch)
+					// (phi' = p + (q sin(phi) + r cos(phi)) tan(theta)); the body roll rate that keeps it is -psi' sin(theta),
+					// as the STOVL laws' own Euler mapping has it. Bench, 12 t, 270 km/h, 35 deg bank, nose held at 30 deg:
+					// without it the released bank crept 35 -> 57 deg in 10 s
+					float thR = I.theta * 0.0174532924f;
+					float phR0 = I.phi * 0.0174532924f;
+					float psiDotM = (I.rates.y * Mathf.Sin(phR0) + I.rates.z * Mathf.Cos(phR0)) / Mathf.Max(0.17364818f, Mathf.Cos(thR));
+					ctolPTurn = (0f - psiDotM) * Mathf.Sin(thR);
+				}
 				float gDotC = I.qCtol * 0.0174532924f + ((relC && !I.wow) ? (1.5f * Mathf.Clamp(gamHoldC - gam, -5f, 5f) * 0.0174532924f) : 0f);
 				float n1C = I.mass * 9.81f * Vector3.Dot(Vector3.up, lHat);
 				float nReqC = n1C + I.mass * Mathf.Max(vA, 0f) * gDotC;
@@ -3544,7 +4145,12 @@ namespace Vortex_FS20.FCS
 					Vector3 fAero = I.mass * (I.accel - Physics.gravity) - fPropF;
 					float lAct = Vector3.Dot(fAero, lHat);
 					fP = Mathf.Max(0f, sPr * (nReqC - lAct) + (1f - sPr) * (n1C - lRef));
-					ctolQAoA = sPr * Mathf.Clamp(2f * (aRefW - I.alpha), -3f, 1.5f);
+					// (0.5.22 StovlCtolNoseHold: the nose is walked up to the reference AoA only, never down to it, plus the turn's
+					// attitude rate. Above the reference the wing carries more than its planned share, the propulsion gives that back
+					// and the path rises until the AoA is back (nose held). Below it the walk up is how the load passes from the
+					// propulsion to the wing as the speed grows: without it the nose held the AoA at 5 deg on a full-lever short
+					// take-off, the wing's share was missing and the jet sank from 16 to 2 m at 300-400 km/h (bench X))
+					ctolQAoA = Plugin.StovlCtolNoseHold ? (sPr * Mathf.Clamp(2f * (aRefW - I.alpha), 0f, 1.5f)) : (sPr * Mathf.Clamp(2f * (aRefW - I.alpha), -3f, 1.5f));
 				}
 				dbgCtolQAoA = ctolQAoA;
 				dbgCtolFp = fP;
@@ -3619,7 +4225,18 @@ namespace Vortex_FS20.FCS
 				}
 				// (0.2.9: not under the CTOL blend, where the lever is thrust and the airbrake the pilot's)
 				brakeAuto = Mathf.Min(brakeAuto, spdAb * (1f - wC));
-				if (lamV < 0.01f || I.wow)
+				// Vortex 0.5.26 (StovlTiltAllRegimes): the fore-aft tilt is how the thrust's share of the lift brakes or pushes the
+				// jet, so it is worked out wherever the jet flies on the thrust, by that share alone (TiltShare), and the share is
+				// taken before the tilt-rate limit, so what moves at the tilt rate is the tilt the attitude actually takes (the
+				// rate the governor and the thrust-lag reserve are planned on). 0.2.7-0.5.25 gated it on what the lever and stick
+				// mean instead (none in the path regime, lamV 0, scaled by lamT) and weighted it by the share only after the
+				// slew: between the CTOL blend's end and the hover hand-over the jet, still mostly on the thrust (the wing
+				// carried ~25 % at 37 m/s, 11:36 log), braked with nothing but the nozzle and the airbrake (~1 m/s^2 for 4
+				// asked), the nose came down 3 deg to the wing's attitude, and the tilt then came in all at once (7.5 -> 37 deg
+				// at up to 11 deg/s). Ungated with the share left after the slew, the tilt built up unflown under the wing and
+				// the CTOL blend and came in as they faded: an 8 deg/s pitch-rate bump at the blend's end, and a 13.6 t
+				// low-T/W stop that pitched to 30 deg and ran 2 km/h under its floor (bench).
+				if ((!Plugin.StovlTiltAllRegimes && lamV < 0.01f) || I.wow)
 				{
 					thetaAssist = Mathf.MoveTowards(thetaAssist, 0f, 4f * dt);
 				}
@@ -3659,10 +4276,10 @@ namespace Vortex_FS20.FCS
 						dMin = Mathf.Min(a0, a1);
 						dMax = Mathf.Max(a0, a1);
 					}
-					float want = Mathf.Atan2(aLong, 9.81f) * 57.29578f;
+					float want = Mathf.Atan2(aLong, gL) * 57.29578f;
 					float tgtA = (want < dMin) ? (dMin - want) : ((want > dMax) ? (dMax - want) : 0f);
-					float tiltLim = Mathf.Atan2(aHv, 9.81f) * 57.29578f;
-					tgtA = Mathf.Clamp(lamT * tgtA, -tiltLim, tiltLim);
+					float tiltLim = Mathf.Atan2(aHv, gL) * 57.29578f;
+					tgtA = Mathf.Clamp((Plugin.StovlTiltAllRegimes ? TiltShare(ref I, vSym, wC) : lamT) * tgtA, -tiltLim, tiltLim);
 					// (0.2.8: away from level, only as fast as the governor's share of the thrust-rate headroom)
 					bool incTh = Mathf.Abs(tgtA) > Mathf.Abs(thetaAssist) && tgtA * thetaAssist >= 0f;
 					// (0.4.0: at the pitch axis's tilt rate, group B)
@@ -3674,7 +4291,7 @@ namespace Vortex_FS20.FCS
 					thetaAssist = Mathf.MoveTowards(thetaAssist, tgtA, rateFwd * lamG * dt);
 					// (0.4.7: the lift this tilt gave back this tick, for the governor's budget next tick)
 					retThLast = (Mathf.Abs(thetaAssist) < Mathf.Abs(thA0)) ? (Mathf.Tan(Mathf.Min(Mathf.Abs(thA0), 80f) * 0.0174532924f) * (Mathf.Abs(thA0) - Mathf.Abs(thetaAssist)) / Mathf.Max(dt, 0.0001f) * 0.0174532924f) : 0f;
-					dbgATiltLeft = 9.81f * Mathf.Tan(Mathf.Max(0f, tiltLim - Mathf.Abs(thetaAssist)) * 0.0174532924f);
+					dbgATiltLeft = gL * Mathf.Tan(Mathf.Max(0f, tiltLim - Mathf.Abs(thetaAssist)) * 0.0174532924f);
 					incThLast = incTh;
 					decThLast = !incTh && Mathf.Abs(tgtA - thetaAssist) > 0.01f;
 				}
@@ -3819,7 +4436,8 @@ namespace Vortex_FS20.FCS
 			wCtolBlend = (!I.wow && Mathf.Abs(I.sp) < 0.05f) ? (1f - Smooth(PitchHoldAoA0, PitchHoldAoA1, alphaLevel)) : 0f;
 			if (wCtolBlend < 0.01f)
 			{
-				thetaHold = I.theta;
+				// (Vortex 0.5.26: less the fore-aft tilt, as under the CTOL blend below)
+				thetaHold = I.theta - (Plugin.StovlTiltAllRegimes ? thetaAssist : 0f);
 			}
 			else
 			{
@@ -3838,12 +4456,17 @@ namespace Vortex_FS20.FCS
 			thetaRefF = Mathf.MoveTowards(thetaRefF, thetaRef, ((thetaRef > thetaRefF) ? thUp : thDn) * dt);
 			// 0.2.9: under the CTOL blend the attitude references follow the jet (the CTOL pitch law flies the nose), so the
 			// STOVL laws take over from where it is when the airspeed falls back through the blend
+			// (Vortex 0.5.26: the jet's attitude less the fore-aft tilt it carries, since both references are the attitude
+			// without it and the tilt is added after them; with the tilt now flown under the blend, following the whole
+			// attitude took each degree of tilt into the reference and added it again: bench, 14.5 t low-T/W stop, 8 deg of
+			// tilt and the nose at 27 deg. Until 0.5.25 the tilt was always 0 here, lamV 0.)
 			if (wC > 0f)
 			{
-				thetaRefF = Mathf.Lerp(thetaRefF, I.theta, wC);
-				thetaHold = Mathf.Lerp(thetaHold, I.theta, wC);
+				float thJet = I.theta - (Plugin.StovlTiltAllRegimes ? thetaAssist : 0f);
+				thetaRefF = Mathf.Lerp(thetaRefF, thJet, wC);
+				thetaHold = Mathf.Lerp(thetaHold, thJet, wC);
 			}
-			float thetaTgt = thetaRefF + ((I.wow && airT <= 0f) ? 0f : ((1f - wWing) * (1f - wCtolBlend) * thetaAssist));
+			float thetaTgt = thetaRefF + ((I.wow && airT <= 0f) ? 0f : ((Plugin.StovlTiltAllRegimes ? 1f : ((1f - wWing) * (1f - wCtolBlend))) * thetaAssist));
 			dbgThetaAssist = thetaAssist;
 			dbgLamL = qDyn * sCLa * Plugin.StovlWingAoAMax * 0.0174532924f / Mathf.Max(1f, I.mass * 9.81f);
 			dbgThetaRef = thetaTgt;
@@ -3859,7 +4482,7 @@ namespace Vortex_FS20.FCS
 			// ---- lateral: bank / translational rate / roll rate
 			// (0.2.6: from the shared translation budget, above)
 			float aY = aYTrc;
-			float phiTrcRaw = Mathf.Atan2(aY, g) * 57.29578f;
+			float phiTrcRaw = Mathf.Atan2(aY, gL) * 57.29578f;
 			// 0.1.6: the translation bank moves at StovlTrcBankRate at most, so the thrust (0.35 s spool) keeps up with the lift
 			// the bank tilts away: a stop from a 29 kt skid snapped to 11 deg in 0.3 s, the jet sank 0.5 m/s, the height priority
 			// cut the bank to 3 and it came in again (bench). Outside the TRC regime it follows at once.
@@ -3879,7 +4502,7 @@ namespace Vortex_FS20.FCS
 			// and the nozzle's push - so the yaw law knows how much of that bank is there by now: the tilt-rate limit here,
 			// then the governor's rate and the bank loop's own approach below)
 			{
-				float phiYawRaw = Mathf.Atan2(aSideYaw, g) * 57.29578f;
+				float phiYawRaw = Mathf.Atan2(aSideYaw, gL) * 57.29578f;
 				yawShareInit = !(wLat < 0.01f || !lawInitTrc || I.wow);
 				phiYawS = yawShareInit ? Mathf.MoveTowards(phiYawS, phiYawRaw, rateSide * dt) : phiYawRaw;
 			}
@@ -4035,7 +4658,7 @@ namespace Vortex_FS20.FCS
 			// Vortex 0.3.9 (Tom, 17 Nov: no fixed yaw-rate limit): the pedal's full rate is what the yaw axis can start and stop
 			// within StovlYawStopTime at its authority now (aYaw, the ramp below), so it follows mass, fuel, stores and the lift
 			// system's thrust; StovlYawStopTime is set so a clean jet with full fuel in the hover gets the old 30 deg/s
-			float yawRateMax = YawRateMax(aYaw);
+			float yawRateMax = YawRateMax(aYaw, dt);
 			float yawSlew = aYaw;
 			float turnLag = 0f;
 			// Vortex 0.4.7 (StovlTurnYawLimit; Tom's rule: the FCS does not let the pilot command what the jet cannot hold): where
@@ -4052,7 +4675,7 @@ namespace Vortex_FS20.FCS
 			{
 				float gsT = Mathf.Max(gs, 0.5f);
 				float rTurn = Mathf.Clamp(Plugin.StovlTurnShare, 0.3f, 1f) * (VhTurnAvail ? Mathf.Min(aTrcStopF, aTurnF) : aTrcStopF) / gsT * 57.29578f;
-				float sTurn = 9.81f * rateSide / gsT;
+				float sTurn = gL * rateSide / gsT;
 				// (and the yaw loop gets the command the bank loop's lag later than the bank does, by the share of the sideways
 				// capability a full-pedal turn takes at this speed: none in the hover. With both given it at once the bank
 				// trailed the yaw by that lag on the way in and on the way out: bench, 13.8 t, 30 kt, 1.6 m/s of skid into the
@@ -4133,13 +4756,29 @@ namespace Vortex_FS20.FCS
 			if (sideFF && psiJInit && !psiHold && !(I.wow && airT <= 0f))
 			{
 				float kAbs = Mathf.Abs(kSideYaw);
-				float eJ = (psiDotH - psiDotJ) * 0.0174532924f;
-				float jB = Mathf.Max(0.01f, 9.81f * rateSide * 0.0174532924f);
 				float tauB = Mathf.Max(0.05f, tauBankYLast);
+				// Vortex 0.5.16 (StovlLiftCorrect): with the lift under the weight (a climb being stopped, a descent starting:
+				// deep but short, over before a bank could be added for it) the bank that is there turns the flight path
+				// slower by the lift's share of the weight, so the nose is asked for that share of its rate, where the turn is
+				// the bank's to carry (the weight below). The bank's own target stays on the weight; the yaw axis is the fast
+				// one. With the pedal let go the nose's rate only falls (it does not pick up again as the lift comes back).
+				float psiTgt = psiDotH;
+				if (Plugin.StovlLiftCorrect && Plugin.StovlYawPivot && gGive < g && VhLiftYaw)
+				{
+					float wLiftB = lamY * Mathf.Clamp01(Mathf.Abs(uTurnH) * tauB / Mathf.Max(0.01f, kAbs));
+					psiTgt = psiDotH * Mathf.Lerp(1f, gGive / g, wLiftB);
+				}
+				if (Plugin.StovlLiftCorrect && VhLiftYaw && Mathf.Abs(I.sy) < 0.05f && liftYawCut && psiTgt * psiDotJ > 0f && Mathf.Abs(psiTgt) > Mathf.Abs(psiDotJ))
+				{
+					psiTgt = psiDotJ;
+				}
+				liftYawCut = (liftYawCut || psiTgt != psiDotH) && Mathf.Abs(I.sy) < 0.05f && Mathf.Abs(psiDotJ) > 0.5f;
+				float eJ = (psiTgt - psiDotJ) * 0.0174532924f;
+				float jB = Mathf.Max(0.01f, gL * rateSide * 0.0174532924f);
 				float aWant = Mathf.Min(kAbs * aYaw * 0.0174532924f, jB * (Mathf.Sqrt(tauB * tauB + 2f * kAbs * Mathf.Abs(eJ) / jB) - tauB));
 				// (the bank's push to cancel a yaw acceleration a is -k a: to the right for a nose-right one behind the CG)
 				aSideFF = lamY * (0f - Mathf.Sign(kSideYaw)) * Mathf.Sign(eJ) * aWant;
-				float aBank = 9.81f * Mathf.Tan(Mathf.Clamp(phiYawM, -60f, 60f) * 0.0174532924f);
+				float aBank = gGive * Mathf.Tan(Mathf.Clamp(phiYawM, -60f, 60f) * 0.0174532924f);
 				// (the turn at the heading rate the yaw has been given so far; the bank's demand above runs on the pedal's own
 				// command, a bank-loop lag ahead of it, as since 0.4.7)
 				float aGate = (uTurnH * psiDotJ * 0.0174532924f - aBank) / kSideYaw;
@@ -4177,7 +4816,7 @@ namespace Vortex_FS20.FCS
 				psiDotJ = psiDotH;
 				aPsiJ = 0f;
 			}
-			float psiDotP = (vA > 5f) ? (g * Mathf.Tan(Mathf.Clamp(I.phi, -80f, 80f) * 0.0174532924f) / vA * 57.29578f) : 0f;
+			float psiDotP = (vA > 5f) ? (gGive * Mathf.Tan(Mathf.Clamp(I.phi, -80f, 80f) * 0.0174532924f) / vA * 57.29578f) : 0f;
 			float psiDot = Mathf.Lerp(psiDotP, psiDotH, lamY);
 			// 0.2.1: the pedal is the hover's yaw-rate command (StovlHoverYawRate) wherever the yaw axis easily beats the airframe's
 			// weathervane: the restoring yaw at 45 deg of sideslip (directional stiffness x 45) under a quarter of the yaw budget,
@@ -4187,6 +4826,15 @@ namespace Vortex_FS20.FCS
 			float lamB = Mathf.Max(0f, I.slipStiff) * 45f / Mathf.Max(1f, aYaw);
 			dbgLamB = lamB;
 			float wPed = 1f - Smooth(0.25f, 0.5f, lamB);
+			// Vortex 0.5.22 (StovlLowTwPedal): not where the hover cannot hold its height. The jet flies on its wing there, and the
+			// hover's uncoordinated yaw leaves the path where it was, so the sideslip grows as the heading turns: 021138 log, 15.9 t,
+			// 78 kt, full pedal with a pull: -45 deg in 2.5 s, the rudders' yaw gone past ~-25 deg (22 -> 4 deg/s^2), the yaw ran
+			// on after the pedal was let go and the jet slid sideways below the floor. The pedal is the sideslip command there,
+			// with the turn coordinated (and the yaw stiffness the hover pedal goes on reads ~0 at high AoA anyway: bench 22 deg)
+			if (Plugin.StovlLowTwPedal && lowTw)
+			{
+				wPed = 0f;
+			}
 			float pedOn = Smooth(0.05f, 0.2f, Mathf.Abs(I.sy));
 			dbgWPed = wPed;
 			psiDot += (1f - lamY) * wPed * psiDotPedal;

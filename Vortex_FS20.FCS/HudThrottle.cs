@@ -4,6 +4,7 @@ using System.Reflection;
 using HarmonyLib;
 using TMPro;
 using UnityEngine;
+using UnityEngine.UI;
 
 namespace Vortex_FS20.FCS
 {
@@ -21,9 +22,22 @@ namespace Vortex_FS20.FCS
 
 		private static readonly FieldInfo fPrev = AccessTools.Field(typeof(ThrottleGauge), "throttlePrev");
 
+		private static readonly FieldInfo fLabel = AccessTools.Field(typeof(ThrottleGauge), "throttleLabel");
+
+		// (Vortex 0.5.17: the HUD gauge's MIN label is up: the STOVL detent indicator, which goes under the same gauge label,
+		// moves down a line for it)
+		public static bool HudMinShown;
+
 		private sealed class GaugeState
 		{
 			public GameObject tick;
+
+			// Vortex 0.5.17: the minimum airspeed label under the gauge's own label (a copy of it)
+			public GameObject minGo;
+
+			public TextMeshProUGUI minLbl;
+
+			public string minText;
 
 			public bool shown;
 
@@ -62,6 +76,7 @@ namespace Vortex_FS20.FCS
 		{
 			Aircraft a = fAircraft?.GetValue(g) as Aircraft;
 			string text = null;
+			float minKt = 0f;
 			if ((UnityEngine.Object)(object)a != null && Registry.IsF22(a))
 			{
 				FcsController c = Registry.Find(a);
@@ -70,17 +85,22 @@ namespace Vortex_FS20.FCS
 				{
 					text = s.hudText ?? "0 GS";
 				}
+				if (s != null && c.Engaged && !c.Failed && !s.freestyle)
+				{
+					minKt = s.MinAirspeedKt;
+				}
 			}
 			int id = g.GetInstanceID();
 			if (!gauges.TryGetValue(id, out var gs))
 			{
-				if (text == null)
+				if (text == null && minKt <= 0f)
 				{
 					return;
 				}
 				gs = new GaugeState();
 				gauges[id] = gs;
 			}
+			MinLabel(g, gs, minKt);
 			TextMeshProUGUI reading = fReading?.GetValue(g) as TextMeshProUGUI;
 			if (text == null)
 			{
@@ -119,6 +139,87 @@ namespace Vortex_FS20.FCS
 				{
 					gs.tick.SetActive(vis);
 				}
+			}
+		}
+
+		// Vortex 0.5.17 (Tom, 20 Nov: "also the cockpit hud, can you add min airspeed to the throttle scale side"): while the jet
+		// is too heavy to hover, every throttle gauge (the HUD's and the cockpit's) shows the minimum airspeed the speed floor
+		// holds, "MIN 50 KT", one line under the gauge's own label, in its style (the slot the STOVL detent indicator uses;
+		// that one moves down a line). The text is rebuilt only when the number changes.
+		private static void MinLabel(ThrottleGauge g, GaugeState gs, float minKt)
+		{
+			TextMeshProUGUI src = fLabel?.GetValue(g) as TextMeshProUGUI;
+			bool want = minKt > 0f && src != null;
+			bool isHud = SceneSingleton<FlightHud>.i != null && ((Component)(object)g).transform.IsChildOf(((Component)(object)SceneSingleton<FlightHud>.i).transform);
+			if (!want)
+			{
+				if (gs.minGo != null && gs.minGo.activeSelf)
+				{
+					gs.minGo.SetActive(false);
+				}
+				if (isHud)
+				{
+					HudMinShown = false;
+				}
+				return;
+			}
+			if (gs.minGo == null || gs.minLbl == null)
+			{
+				gs.minGo = UnityEngine.Object.Instantiate(src.gameObject, src.transform.parent);
+				gs.minGo.name = "VortexFCS_MinAirspeed";
+				gs.minLbl = gs.minGo.GetComponent<TextMeshProUGUI>();
+				foreach (MonoBehaviour mb in gs.minGo.GetComponents<MonoBehaviour>())
+				{
+					if (mb != null && !(mb is Graphic))
+					{
+						UnityEngine.Object.Destroy(mb);
+					}
+				}
+				for (int i = gs.minGo.transform.childCount - 1; i >= 0; i--)
+				{
+					UnityEngine.Object.Destroy(gs.minGo.transform.GetChild(i).gameObject);
+				}
+				if (gs.minLbl == null)
+				{
+					UnityEngine.Object.Destroy(gs.minGo);
+					gs.minGo = null;
+					return;
+				}
+				gs.minLbl.raycastTarget = false;
+				gs.minLbl.richText = false;
+				gs.minLbl.enableWordWrapping = false;
+				gs.minText = null;
+			}
+			string t = "MIN " + Mathf.RoundToInt(minKt) + " KT";
+			if (gs.minText != t)
+			{
+				gs.minLbl.text = t;
+				gs.minText = t;
+			}
+			gs.minLbl.font = src.font;
+			gs.minLbl.fontSharedMaterial = src.fontSharedMaterial;
+			gs.minLbl.color = src.color;
+			gs.minLbl.fontStyle = src.fontStyle;
+			// (the detent indicator's size and line step, so the two stack: 65 % of the gauge label's size)
+			gs.minLbl.fontSize = Mathf.Max(12f, src.fontSize * 0.65f);
+			gs.minLbl.alignment = src.alignment;
+			RectTransform sr = src.rectTransform;
+			RectTransform mr = gs.minLbl.rectTransform;
+			mr.anchorMin = sr.anchorMin;
+			mr.anchorMax = sr.anchorMax;
+			mr.pivot = sr.pivot;
+			mr.sizeDelta = new Vector2(Mathf.Max(sr.sizeDelta.x, src.fontSize * 7f), sr.sizeDelta.y);
+			mr.localRotation = sr.localRotation;
+			mr.localScale = sr.localScale;
+			mr.anchoredPosition = sr.anchoredPosition + new Vector2(0f, 0f - Mathf.Max(22f, src.fontSize * 0.65f));
+			bool vis = src.gameObject.activeInHierarchy;
+			if (gs.minGo.activeSelf != vis)
+			{
+				gs.minGo.SetActive(vis);
+			}
+			if (isHud)
+			{
+				HudMinShown = vis;
 			}
 		}
 	}

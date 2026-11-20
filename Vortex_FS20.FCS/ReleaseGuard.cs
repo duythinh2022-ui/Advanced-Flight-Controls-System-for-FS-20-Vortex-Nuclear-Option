@@ -216,7 +216,7 @@ namespace Vortex_FS20.FCS
 				blocked = true;
 				blockPress = pressId;
 				float hold = Plugin.ReleaseGuardHold;
-				StovlSystem.Report?.Invoke(a, "UNSAFE WPN RELEASE - HOLD " + hold.ToString("0.#") + "s");
+				StovlSystem.Report?.Invoke(a, "UNSAFE WPN REL - HOLD " + hold.ToString("0.#") + " SEC");
 				Plugin.Log.LogInfo($"Vortex FCS release guard: blocked {wi.weaponName} x{n} ({dm:F0} kg): roll trim needed {need:F0} N m at once ({100f * need / auth:F0} % of the {auth:F0} N m of roll authority in the hover at that weight; limit {TransientShare * 100f:F0} %), {settled:F0} N m once the fuel has balanced ({100f * settled / auth:F0} %). CG {yOff:F3} m off the lift line after the release.");
 				return false;
 			}
