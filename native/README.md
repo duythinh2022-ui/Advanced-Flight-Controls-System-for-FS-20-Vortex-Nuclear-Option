@@ -31,15 +31,32 @@ first call. Checked on the game's Mono with all five FCS plugins loaded at once:
   library.
 - Then run the checks below. Zero differences on the bench is the pass mark.
 
-## Build
+## Build (reproducible)
+The shipped `native/prebuilt/Vortex_FcsCore.dll` (embedded in `Vortex_FS20_FCS.dll`) is built by `native/build-repro.sh`:
+a plain `cargo build --release --locked --target x86_64-pc-windows-gnu` with the toolchain pinned in
+`fcs_core/rust-toolchain.toml` (Rust 1.97.0), the build paths remapped and no linker timestamp, so the same source gives
+the same bytes. The reference environment is the Docker image CI uses (Debian bookworm's mingw-w64 links):
 ```
-bash native/build.sh          # the game's DLL  -> fcs_core/target/x86_64-pc-windows-gnu/release/Vortex_FcsCore.dll
-bash native/build.sh linux    # the bench's .so  (bench.sh build does this and copies it into bench/bin)
+docker run --rm -v "$PWD":/src -w /src rust:1.97.0-bookworm bash -c \
+  "apt-get update -qq && apt-get install -y -qq gcc-mingw-w64-x86-64 >/dev/null && bash native/build-repro.sh"
 ```
-Built with Rust 1.97.1 (Ubuntu's `rustc-1.97`), target `x86_64-pc-windows-gnu`, mingw-w64 gcc as the linker. The Windows target's
-prebuilt standard library could not be downloaded in the build environment, so `build.sh` compiles it from source
-(`-Zbuild-std`); see the comment at its top. No crates are downloaded. The F-22E's core was built with Rust 1.99.1: the code
-needs nothing version-specific (IEEE float arithmetic, no maths library but `atan2`).
+It prints the SHA-256 of the DLL it built and of the committed prebuilt; they must be equal.
+
+CI (`.github/workflows/native-core.yml`) does this on every push: it builds the core twice in different folders (the two
+must match), publishes a signed build-provenance attestation for the DLL, and fails if the committed prebuilt is not
+that build. `bash native/build.sh linux` builds the bench's `.so` (not shipped).
+
+## Verify a shipped core
+The core inside a release is `Vortex_FcsCore.dll`, an embedded resource of `Vortex_FS20_FCS.dll` (ILSpy / dnSpy:
+Resources > Vortex_FcsCore.dll > Save). The game also writes it to `BepInEx\cache\Vortex_FcsCore\<hash>\Vortex_FcsCore.dll`.
+```
+gh attestation verify Vortex_FcsCore.dll -R duythinh2022-ui/Advanced-Flight-Controls-System-for-FS-20-Vortex-Nuclear-Option
+```
+This shows the workflow run and the commit that built that exact file. The plugin calls only the seven exports
+(`rev_fcs_abi`, `rev_fcs_sizes`, `rev_fcs_solve`, `rev_fcs_grid`, `rev_fcs_grid_size`, `rev_fcs_cpl`, `rev_fcs_cpl_size`),
+declared in `Vortex_FS20.FCS/FcsNative.cs`. The source (`fcs_core/src/lib.rs`, `cpl.rs`) is numeric code only: no file,
+network, process or thread code. The DLL's import table still lists such Windows functions because Rust's standard
+library is linked in; nothing in the core calls them.
 
 ## Check on the bench (strict float arithmetic: must be bit-identical)
 ```

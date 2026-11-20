@@ -1,5 +1,7 @@
 #!/bin/bash
 # Builds the native core (Vortex_FcsCore): the allocator's solve and the grid kernels, ported from the F-22E FCS 4.1.0 core.
+# The SHIPPED Windows DLL is built by native/build-repro.sh (pinned toolchain, reproducible; see README). This script is
+# the older local build: `build.sh linux` builds the bench's .so; the Windows path below is kept only for reference.
 #   build.sh            -> fcs_core/target/x86_64-pc-windows-gnu/release/Vortex_FcsCore.dll   (the game; ships beside the plugin DLL)
 #   build.sh linux      -> fcs_core/target/release/libVortex_FcsCore.so                       (the bench; bench.sh build copies it)
 # Built with Rust 1.97.1 (Ubuntu's rustc-1.97 / rust-1.97-src): the Windows standard library is compiled from source
