@@ -193,6 +193,7 @@ namespace Vortex_FS20.FCS
 			public int side;      // Reserve: 0 both sides, +1 / -1 that side only, 2 phase 1 only
 		}
 
+#if NATIVE_CORE
 		[DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
 		private static extern int rev_fcs_cpl(CplIo* io);
 
@@ -216,6 +217,26 @@ namespace Vortex_FS20.FCS
 
 		[DllImport("kernel32", CharSet = CharSet.Unicode, SetLastError = true)]
 		private static extern IntPtr LoadLibraryW(string path);
+#else
+		// 0.6.6: the C#-only build (the default; the NOMM build) has no native code and no P/Invoke at all: these stand-ins are
+		// pure C# and are never reached (Wanted is false there, so nothing loads and every caller runs its C# method). The
+		// native build (build.sh ... -define:NATIVE_CORE) declares the real imports and embeds native/prebuilt/Vortex_FcsCore.dll.
+		private static int rev_fcs_cpl(CplIo* io) { return -100; }
+
+		private static int rev_fcs_cpl_size() { return -100; }
+
+		private static int rev_fcs_grid(GridIn* g, int mode) { return -100; }
+
+		private static int rev_fcs_grid_size() { return -100; }
+
+		private static int rev_fcs_abi() { return -100; }
+
+		private static int rev_fcs_sizes() { return -100; }
+
+		private static int rev_fcs_solve(AllocIo* io, EffN* effs) { return -100; }
+
+		private static IntPtr LoadLibraryW(string path) { return IntPtr.Zero; }
+#endif
 
 		private static readonly object gate = new object();
 
@@ -491,10 +512,22 @@ namespace Vortex_FS20.FCS
 		}
 
 		// what Plugin.NativeAllocator asks for on this runtime
+		// 0.6.6: false in the C#-only build, whatever NativeAllocator says (there is no native core in it)
+		public const bool InBuild =
+#if NATIVE_CORE
+			true;
+#else
+			false;
+#endif
+
 		public static bool Wanted
 		{
 			get
 			{
+				if (!InBuild)
+				{
+					return false;
+				}
 				int m = Plugin.NativeAllocator;
 				return m >= 2 || (m == 1 && StrictFloat);
 			}
@@ -522,6 +555,12 @@ namespace Vortex_FS20.FCS
 			{
 				if (state != 0)
 				{
+					return;
+				}
+				if (!InBuild)
+				{
+					Why = "C#-only build: no native core in it";
+					Volatile.Write(ref state, -1);
 					return;
 				}
 				try
@@ -1035,6 +1074,10 @@ namespace Vortex_FS20.FCS
 			string fm = StrictFloat ? "this runtime's float arithmetic is strict 32-bit: the native solve is bit-identical to the C# one"
 				: "this runtime carries C# float arithmetic in double (Unity's Mono setting): the native solve is not bit-identical to the C# one here";
 			int m = Plugin.NativeAllocator;
+			if (!InBuild)
+			{
+				return "C#-only build: no native core, the C# solve, loops and LP run (NativeAllocator, NativeSweep, NativeTables and NativeCoupledCap have no effect)";
+			}
 			if (!Wanted)
 			{
 				return "not used (NativeAllocator = " + m + (m == 1 ? ", used only where it is bit-identical" : "") + "); " + fm;

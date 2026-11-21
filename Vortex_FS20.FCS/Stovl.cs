@@ -1549,6 +1549,27 @@ namespace Vortex_FS20.FCS
 		private float gLiftNow = 9.81f;
 
 		private float accYF;
+		private float aLiftF;
+		// Vortex 0.6.5 (StovlPushEstimator): what the measured vertical acceleration does beyond the RPM's lift model, learned
+		// in flight: y = accYF - aLiftF ~ c0 + c1 aLiftF + c2 d(aLiftF)/dt + c3 vF |vF| (c1: the lift per RPM off by that
+		// share; c2: the force trailing the RPM by -c2 seconds; c3: drag with the vertical speed squared). Recursive least
+		// squares, normalised to the measurement noise; forgetting over PushWindow seconds, only while the data moves (else the
+		// covariance would grow in the directions nothing excites), the covariance never above its prior.
+		private float aLiftPrevF;
+		private float aMeasF;
+		private float vCgPrevY;
+		private bool vCgPrevSet;
+		private float vFilt;
+		private readonly float[] pushTh = new float[4];
+		private readonly float[,] pushP = new float[4, 4];
+		private bool pushInit;
+		private float pushVar;
+		private float pushN;
+		private float pushCov1;
+		private float lastDtPush = 0.0167f;
+		private float pushEPrev;
+		private const float PushWindow = 10f;
+		private static readonly float[] PushPrior = new float[4] { 250f, 10f, 2.5f, 0.1f };
 
 		// (bench: what the bank is planned on: 0 = the weight, 1 = the lift, 2 = the lift when it is above the weight;
 		// what a bank is taken to give: 0 = the weight, 1 = the lift asked, 2 = the lift measured)
@@ -2136,7 +2157,237 @@ namespace Vortex_FS20.FCS
 
 		// 0.2.8 command governor (vertical first). The engine answers a throttle step as a 1 s lag (the game's spool:
 		// rpm += (target - rpm) dt, within the spool rate), so the thrust can rise no faster than (full dry - thrust now) / 1 s.
+		// the game's engine law: rpm += clamp(target - rpm, +-spoolRate) x dt, so the RPM closes on its target as a 1 s lag and
+		// never faster than the spool rate; with the target at the throttle's end (the FCS over-drives it, RpmLead), the RPM
+		// can rise at min(spoolRate, reachable RPM - rpm) per second and fall at min(spoolRate, rpm - idle). EngineLag is that
+		// 1 s (not a tuning value); the spool-rate side is EngineRpmRate.
 		private const float EngineLag = 1f;
+
+		// Vortex 0.6.3 (StovlEngineResponse): how fast the engine can move its RPM from rpm, by the game's law above: up toward
+		// the reachable RPM (the damage state's ceiling) or down toward idle
+		private float EngineRpmRate(float rpm, bool up)
+		{
+			float span = Mathf.Max(1f, hw.MaxRpm - hw.MinRpm);
+			float reach = hw.MinRpm + span * (0.5f * Mathf.Clamp01(hw.Condition) + 0.5f);
+			float room = up ? (reach - rpm) : (rpm - hw.MinRpm);
+			return Mathf.Max(0f, Mathf.Min(Mathf.Max(1f, hw.SpoolRate), room / EngineLag));
+		}
+
+		// Vortex 0.6.4 (StovlEngineResponse): where a vertical stop ends if a deceleration aHold along it is asked for tHold
+		// and the thrust then sent back to the hover's: the
+		// game's engine law run forward from the RPM the engine has (rpm += clamp(target - rpm, +-spoolRate) x dt, the target
+		// over-driven by the FCS as ThrottleForThrust does, within idle and the reachable RPM), the lift following the RPM
+		// (thrust ratio (rpm - 0.85 idle) / span), and whatever else pushes the jet vertically held at what it is now (aBias:
+		// the measured vertical acceleration less the lift's, both through the same 0.1 s low-pass). Returns the speed along
+		// the stop left when the lift is back at the weight (negative: it would run past the stop).
+		private void PushUpdate(float y, float aL, float dAL, float vv, float dt, bool use)
+		{
+			lastDtPush = Mathf.Max(1e-4f, dt);
+			if (!pushInit)
+			{
+				for (int r = 0; r < 4; r++)
+				{
+					pushTh[r] = 0f;
+					for (int c = 0; c < 4; c++)
+					{
+						pushP[r, c] = (r == c) ? PushPrior[r] : 0f;
+					}
+				}
+				pushInit = true;
+			}
+			if (!use)
+			{
+				return;
+			}
+			float[] x = new float[4] { 1f, aL, dAL, vv };
+			// forgetting only while the regressors move (a held hover teaches nothing about slope, delay or drag)
+			bool moving = Mathf.Abs(dAL) > 0.5f || Mathf.Abs(vv) > 0.25f;
+			float lam = moving ? (1f - dt / PushWindow) : 1f;
+			float[] px = new float[4];
+			float den = lam;
+			for (int r = 0; r < 4; r++)
+			{
+				float acc = 0f;
+				for (int c = 0; c < 4; c++)
+				{
+					acc += pushP[r, c] * x[c];
+				}
+				px[r] = acc;
+				den += x[r] * acc;
+			}
+			float e = y;
+			for (int r = 0; r < 4; r++)
+			{
+				e -= pushTh[r] * x[r];
+			}
+			// (what the fit gets wrong, as a variance over the same window: the stop's margin is planned on it)
+			pushN += 1f;
+			float wN = Mathf.Max(dt / PushWindow, 1f / pushN);
+			pushVar += (e * e - pushVar) * wN;
+			pushCov1 += (e * pushEPrev - pushCov1) * wN;
+			pushEPrev = e;
+			for (int r = 0; r < 4; r++)
+			{
+				pushTh[r] += px[r] / den * e;
+			}
+			for (int r = 0; r < 4; r++)
+			{
+				for (int c = 0; c < 4; c++)
+				{
+					pushP[r, c] = (pushP[r, c] - px[r] * px[c] / den) / lam;
+				}
+			}
+			for (int r = 0; r < 4; r++)
+			{
+				if (pushP[r, r] > PushPrior[r])
+				{
+					float k = Mathf.Sqrt(PushPrior[r] / pushP[r, r]);
+					for (int c = 0; c < 4; c++)
+					{
+						pushP[r, c] *= k;
+						pushP[c, r] *= k;
+					}
+				}
+			}
+		}
+
+		// Vortex 0.6.6: the speed the prediction may be wrong by over the time T the thrust still needs to come back: the
+		// fit's error as a Gauss-Markov process (its variance and its correlation time, from the frame-to-frame correlation
+		// the fit measures), integrated over T: Var = 2 s^2 tc (T - tc (1 - e^(-T/tc))). A slow error (a push the fit has
+		// not learned) runs into the speed with T, as 0.6.5 assumed throughout (s T); fast noise averages out over T, which
+		// 0.6.5 counted in full, so in the game, where the measured acceleration is noisier, the stop aimed to leave tens of
+		// ft/min and its end ran slow.
+		private float StopMargin(float T)
+		{
+			float var = Mathf.Max(0f, pushVar);
+			if (var <= 1e-8f || T <= 0f)
+			{
+				return 0f;
+			}
+			float rho = Mathf.Clamp(pushCov1 / var, 1e-4f, 0.9999f);
+			float tc = (0f - lastDtPush) / (float)System.Math.Log(rho);
+			float x = T / Mathf.Max(1e-4f, tc);
+			float integ = (x < 1e-3f) ? (0.5f * x * x) : (x - (1f - Mathf.Exp(0f - x)));
+			return Mathf.Sqrt(2f * var * tc * tc * integ);
+		}
+
+		// the learned terms as the prediction uses them, inside what is physical (the fit itself runs free: clipping its
+		// state would leave the covariance describing an estimate it no longer has): the lift per RPM within +-30 %, the
+		// force trailing the RPM by 0..0.2 s, drag against the speed
+		private float PushC(int i)
+		{
+			if (!Plugin.StovlPushEstimator)
+			{
+				return 0f;
+			}
+			switch (i)
+			{
+				case 1: return Mathf.Clamp(pushTh[1], -0.3f, 0.3f);
+				case 2: return Mathf.Clamp(pushTh[2], -0.2f, 0f);
+				default: return Mathf.Clamp(pushTh[3], -0.1f, 0f);
+			}
+		}
+
+		private float PredictStopEnd(float vAlong, float dir, float aBias, float aHold, float tHold)
+		{
+			return PredictStopEnd(vAlong, dir, aBias, aHold, tHold, out float _);
+		}
+
+		private float PredictStopEnd(float vAlong, float dir, float aBias, float aHold, float tHold, out float tEnd)
+		{
+			bool est = Plugin.StovlPushEstimator;
+			float c1 = PushC(1);
+			float c2 = PushC(2);
+			float c3 = PushC(3);
+			float b0 = est ? pushB0 : aBias;
+			float span = Mathf.Max(1f, hw.MaxRpm - hw.MinRpm);
+			float reach = hw.MinRpm + span * (0.5f * Mathf.Clamp01(hw.Condition) + 0.5f);
+			float liftPerRatio = Mathf.Max(0.1f, fvPerRpmNow * span / (0.95f * Mathf.Max(0.05f, ThrustReach())) / massEng);
+			float rpm = hw.RpmRatio * hw.MaxRpm;
+			// the RPMs the FCS's thrust aims at: the hover's (lift, with its learned slope, back at the weight against the
+			// outside push) and the hold's (that less the deceleration asked)
+			float aMW = (0f - b0) / (1f + c1);
+			float aMB = (0f - dir * aHold - b0) / (1f + c1);
+			float rpmW = 0.85f * hw.MinRpm + Mathf.Clamp01((9.81f + aMW) / liftPerRatio) * span;
+			float rpmB = 0.85f * hw.MinRpm + Mathf.Clamp01((9.81f + aMB) / liftPerRatio) * span;
+			float spool = Mathf.Max(1f, hw.SpoolRate);
+			float lead = Mathf.Max(0.02f, RpmLead);
+			float v = vAlong;
+			float h = 0.02f;
+			float t = 0f;
+			float tEq = -1f;
+			for (int k = 0; k < 200; k++)
+			{
+				float aM = Mathf.Clamp01((rpm - 0.85f * hw.MinRpm) / span) * liftPerRatio - 9.81f;
+				// (the hold's last step counts by the part of it the hold covers, so the end speed is smooth in the hold's length)
+				float fHold = Mathf.Clamp01((tHold - t) / h);
+				float tgtB = Mathf.Clamp(rpm + (rpmB - rpm) / lead, hw.MinRpm, reach);
+				float tgtW = Mathf.Clamp(rpm + (rpmW - rpm) / lead, hw.MinRpm, reach);
+				float rpmN = rpm + (fHold * Mathf.Clamp(tgtB - rpm, 0f - spool, spool) + (1f - fHold) * Mathf.Clamp(tgtW - rpm, 0f - spool, spool)) * h;
+				float aMn = Mathf.Clamp01((rpmN - 0.85f * hw.MinRpm) / span) * liftPerRatio - 9.81f;
+				float vw = v * dir;
+				float a = ((1f + c1) * aM + c2 * (aMn - aM) / h + c3 * vw * Mathf.Abs(vw) + b0) * dir;
+				// (0.6.6: tEnd is when the lift is first back at the weight, the time the thrust still needs to come back,
+				// not the end of the hold: 0.6.5 counted the hold in, so the stop's margin never fell below the fit's error
+				// times the RPM lead, ~0.01-0.02 m/s, and a stop could rest at that speed with the brake off, never reaching
+				// zero, which is what ends it)
+				if (tEq < 0f && Mathf.Abs(a) < 0.01f)
+				{
+					tEq = t;
+				}
+				if (t >= tHold && Mathf.Abs(a) < 0.01f)
+				{
+					break;
+				}
+				v += a * h;
+				rpm = rpmN;
+				t += h;
+			}
+			tEnd = (tEq >= 0f) ? tEq : t;
+			return v;
+		}
+
+		// 0.6.4's predictor, kept as it was for StovlPushEstimator = false
+		private float PredictStopEnd064(float vAlong, float dir, float aBias, float aHold, float tHold)
+		{
+			float span = Mathf.Max(1f, hw.MaxRpm - hw.MinRpm);
+			float reach = hw.MinRpm + span * (0.5f * Mathf.Clamp01(hw.Condition) + 0.5f);
+			float liftPerRatio = Mathf.Max(0.1f, fvPerRpmNow * span / (0.95f * Mathf.Max(0.05f, ThrustReach())) / massEng);
+			float rpm = hw.RpmRatio * hw.MaxRpm;
+			float rpmW = 0.85f * hw.MinRpm + Mathf.Clamp01((9.81f - aBias) / liftPerRatio) * span;
+			float rpmB = 0.85f * hw.MinRpm + Mathf.Clamp01((9.81f - aBias - dir * aHold) / liftPerRatio) * span;
+			float spool = Mathf.Max(1f, hw.SpoolRate);
+			float lead = Mathf.Max(0.02f, RpmLead);
+			float v = vAlong;
+			float h = 0.02f;
+			float t = 0f;
+			for (int k = 0; k < 200; k++)
+			{
+				float a = (Mathf.Clamp01((rpm - 0.85f * hw.MinRpm) / span) * liftPerRatio - 9.81f + aBias) * dir;
+				if (t >= tHold && Mathf.Abs(a) < 0.01f)
+				{
+					break;
+				}
+				v += a * h;
+				float rpmT = (t < tHold) ? rpmB : rpmW;
+				float target = Mathf.Clamp(rpm + (rpmT - rpm) / lead, hw.MinRpm, reach);
+				rpm += Mathf.Clamp(target - rpm, 0f - spool, spool) * h;
+				t += h;
+			}
+			return v;
+		}
+
+		// the RPM the hover thrust takes (thrust ratio = (rpm - 0.85 idle) / span of the static thrust)
+		private float RpmForLift(float liftAcc)
+		{
+			float span = Mathf.Max(1f, hw.MaxRpm - hw.MinRpm);
+			float ratio = Mathf.Clamp01(liftAcc / Mathf.Max(0.1f, fvPerRpmNow * span / Mathf.Max(1f, massEng)));
+			return 0.85f * hw.MinRpm + ratio * span;
+		}
+
+		private float fvPerRpmNow = 1f;
+
+		private float massEng = 1f;
 
 		internal static bool VhGovern = true;
 
@@ -2510,6 +2761,17 @@ namespace Vortex_FS20.FCS
 
 		private float holdA = 2f;
 
+		public float dbgStopA;
+		public float dbgALiftF;
+		public float dbgPushB;
+		public float dbgPushC1;
+		public float dbgPushC2;
+		public float dbgPushC3;
+		public float dbgPushSd;
+		private float pushB0;
+
+		public float dbgStopJ;
+
 		public float dbgWPed;
 
 		// 0.2.0: the bank the lift can hold in a level turn (deg), for the telemetry
@@ -2686,6 +2948,36 @@ namespace Vortex_FS20.FCS
 			//     above or below the weight. In a deficit the nose's rate is cut to that share (the yaw law below).
 			// A model correction: no gain, and g with no vertical acceleration.
 			accYF += (I.accel.y - accYF) * (dt / (0.1f + dt));
+			// (Vortex 0.6.4: the lift the RPM gives, through the same 0.1 s low-pass, so the stop predictor's correction (the
+			// measured acceleration less the lift's) compares like with like; unfiltered, the measurement's lag read as a push
+			// while the RPM moved and the predicted stop came out long)
+			if (hw != null)
+			{
+				float spanL = Mathf.Max(1f, hw.MaxRpm - hw.MinRpm);
+				float aLiftRaw = Mathf.Clamp01((hw.RpmRatio * hw.MaxRpm - 0.85f * hw.MinRpm) / spanL) * (fvPerRpmNow * spanL / (0.95f * Mathf.Max(0.05f, ThrustReach())) / massEng) - g;
+				aLiftF += (aLiftRaw - aLiftF) * (dt / (0.1f + dt));
+				dbgALiftF = aLiftF;
+				// (Vortex 0.6.5: the measured side is the derivative of the CG's vertical speed, the speed the stop flies, through
+				// the same single 0.1 s low-pass as the lift; I.accel is the root body's velocity derivative after its own 0.05 s
+				// filter, so it trails the lift by that much more and carries the pitch acceleration times the CG's lever)
+				float aCgRaw = vCgPrevSet ? (I.vel.y - vCgPrevY) / Mathf.Max(1e-4f, dt) : 0f;
+				vCgPrevY = I.vel.y;
+				vCgPrevSet = true;
+				aMeasF += (aCgRaw - aMeasF) * (dt / (0.1f + dt));
+				dbgPushB = aMeasF - aLiftF;
+				float dAL = (aLiftF - aLiftPrevF) / Mathf.Max(1e-4f, dt);
+				aLiftPrevF = aLiftF;
+				vFilt += (I.vel.y - vFilt) * (dt / (0.1f + dt));
+				if (Plugin.StovlPushEstimator)
+				{
+					PushUpdate(aMeasF - aLiftF, aLiftF, dAL, vFilt * Mathf.Abs(vFilt), dt, !I.wow && I.radarAlt > 1f);
+				}
+				dbgPushC1 = pushTh[1];
+				dbgPushC2 = pushTh[2];
+				dbgPushC3 = pushTh[3];
+				dbgPushSd = Mathf.Sqrt(Mathf.Max(0f, pushVar));
+				pushB0 = aMeasF - aLiftF - PushC(1) * aLiftF - PushC(2) * dAL - PushC(3) * vFilt * Mathf.Abs(vFilt);
+			}
 			float gL = g;
 			float gGive = g;
 			if (Plugin.StovlLiftCorrect && !I.wow)
@@ -2761,6 +3053,8 @@ namespace Vortex_FS20.FCS
 				RpmLead = (VhLeadFix > 0f) ? VhLeadFix : (2f * (0.05f + dt));
 				float fvPerRpm = fvMax / Mathf.Max(1f, hw.MaxRpm - hw.MinRpm);
 				float spoolT = Mathf.Max(1f, I.mass) / Mathf.Max(1f, fvPerRpm) / Mathf.Max(1f, hw.SpoolRate);
+				fvPerRpmNow = fvPerRpm;
+				massEng = Mathf.Max(1f, I.mass);
 				tauV = Mathf.Clamp(RpmLead + spoolT, 0.2f, 1.5f);
 				kVRate = 1f / (2f * tauV);
 				kVHold = VhHoldRatio * kVRate;
@@ -2802,14 +3096,16 @@ namespace Vortex_FS20.FCS
 					ratioGov = Mathf.Clamp(ratioReq * (9.81f + govVFloor) / (9.81f + govVAsk), 0.05f, 1f);
 				}
 				float hroom = Mathf.Max(0f, 0.95f - ratioReq) / ratioReq;
-				tiltBudget = VhTiltShare * (Mathf.Max(0f, 0.95f - ratioGov) / ratioGov) / EngineLag;
+				// (Vortex 0.6.3, StovlEngineResponse: and never faster than the spool rate lets the thrust ratio rise, the other
+				// side of the game's law, as the way down already had)
+				tiltBudget = Plugin.StovlEngineResponse ? (VhTiltShare * Mathf.Min(Mathf.Max(0f, 0.95f - ratioGov) / EngineLag, hw.SpoolRate / Mathf.Max(1f, hw.MaxRpm - hw.MinRpm)) / ratioGov) : (VhTiltShare * (Mathf.Max(0f, 0.95f - ratioGov) / ratioGov) / EngineLag);
 				// (and the other way: a tilt coming out gives lift back, which the thrust has to shed: it falls as the same lag
 				// toward idle, within the spool rate)
 				float idleR = Mathf.Clamp01(0.15f * hw.MinRpm / Mathf.Max(1f, hw.MaxRpm - hw.MinRpm));
 				float spoolR = hw.SpoolRate / Mathf.Max(1f, hw.MaxRpm - hw.MinRpm);
 				tiltBudgetDn = VhTiltShare * Mathf.Min(Mathf.Max(0f, ratioReq - idleR) / EngineLag, spoolR) / ratioReq;
 				float aPv = Mathf.Max(0f, Vector3.Dot(fNfF, Vector3.up)) / Mathf.Max(1f, I.mass);
-				float rUp = aPv * hroom / EngineLag;
+				float rUp = Plugin.StovlEngineResponse ? Mathf.Min(aPv * hroom / EngineLag, hw.SpoolRate * fvPerRpmNow / massEng) : (aPv * hroom / EngineLag);
 				float dCap = Mathf.Pow(1.5f * VhEventDip * rUp * rUp, 1f / 3f);
 				float postF = 0f;
 				for (int pi = 0; pi < hw.Posts; pi++)
@@ -2818,8 +3114,12 @@ namespace Vortex_FS20.FCS
 				}
 				float fanF = Mathf.Abs(hw.FanPitchFactor) * hw.Doors * hw.RpmRatio;
 				fanFNow = fanF;
-				postTrim += (postIn - postTrim) * (dt / (EngineLag + dt));
-				fanTrim += (fanIn - fanTrim) * (dt / (EngineLag + dt));
+				// (Vortex 0.6.3, StovlEngineResponse: the trims - the post and fan use the thrust has already made up in lift - move
+				// as fast as the thrust does for a small change, the vertical axis's measured response time tauV (the RPM lead
+				// plus the spool time), not the game's 1 s lag of a target pinned at the throttle's end)
+				float trimLag = Plugin.StovlEngineResponse ? tauV : EngineLag;
+				postTrim += (postIn - postTrim) * (dt / (trimLag + dt));
+				fanTrim += (fanIn - fanTrim) * (dt / (trimLag + dt));
 				postCap = (VhEffCaps && fPropInit && !I.wow) ? Mathf.Clamp(dCap * I.mass / Mathf.Max(1f, postF), 0.2f, 1f) : 1f;
 				fanCap = (VhEffCaps && fPropInit && !I.wow) ? Mathf.Clamp(dCap * I.mass / Mathf.Max(1f, fanF), 0.1f, 1f) : 1f;
 			}
@@ -2930,7 +3230,7 @@ namespace Vortex_FS20.FCS
 			dbgTiltPitchLift = aTiltPitchN;
 			if (Plugin.StovlTiltLiftLimit && I.fanPitchAuth > 0f && !I.wow)
 			{
-				float rUpS = Mathf.Max(0f, fLiftBodyMax / Mathf.Max(1f, I.mass) - 9.81f) / EngineLag;
+				float rUpS = Plugin.StovlEngineResponse ? Mathf.Min(Mathf.Max(0f, fLiftBodyMax / Mathf.Max(1f, I.mass) - 9.81f) / EngineLag, hw.SpoolRate * fvPerRpmNow / massEng) : (Mathf.Max(0f, fLiftBodyMax / Mathf.Max(1f, I.mass) - 9.81f) / EngineLag);
 				float dCapS = Mathf.Pow(1.5f * Mathf.Clamp(Plugin.StovlTiltLiftDip, 0.01f, 2f) * rUpS * rUpS, 1f / 3f);
 				float fanShare = Mathf.Clamp01(dCapS * I.mass / Mathf.Max(1f, fanFNow));
 				float fanHalf = 0.5f * (Mathf.Min(1f, Mathf.Max(0f, fanTrim) + fanCap) + 1f) * I.fanPitchAuth;
@@ -3621,6 +3921,14 @@ namespace Vortex_FS20.FCS
 					hRef = I.pos.y + Mathf.Sign(v0) * Mathf.Max(Mathf.Abs(v0) / holdK, v0 * v0 / (2f * holdA));
 					holdDir = (Mathf.Abs(v0) > 0.1f) ? Mathf.Sign(v0) : 0f;
 				}
+				else if (holdDir != 0f && Plugin.StovlEngineResponse)
+				{
+					if (v0 * holdDir <= 0f)
+					{
+						hRef = I.pos.y;
+						holdDir = 0f;
+					}
+				}
 				else if (holdDir != 0f)
 				{
 					float vAlong = v0 * holdDir;
@@ -3640,6 +3948,109 @@ namespace Vortex_FS20.FCS
 				{
 					hdotCmd = Mathf.Max(vA, 5f) * Mathf.Sin(gamRef * 0.0174532924f);
 					hdotFF = 0f;
+				}
+				else if (holdDir != 0f && Plugin.StovlEngineResponse)
+				{
+					// Vortex 0.6.3/0.6.4 (StovlEngineResponse; Tom, 20 Nov: a small sink and a slight fore/aft sway when the
+					// released v/s stick stops a climb, same for a descent; "model in actual engine response speed for everything
+					// without the fixed assumption"; then "is the spool time has spool rate and spool acceleration accounted in?
+					// would using spool acceleration model for prediction beneficial"). The stop runs the game's own engine law
+					// forward every frame (PredictStopEnd: the RPM closes on the over-driven target as a 1 s lag, never faster
+					// than the spool rate; the game's engine has no spool acceleration of its own), from the RPM the engine has
+					// now, and asks the deceleration that leaves no speed when the thrust is back at the hover's. No fixed
+					// deceleration profile and no assumed response time. 0.2.8-0.6.2 flew a distance profile min(k e, sqrt(2 a e))
+					// from a stopping point set at the release with 80 % of the cap: the full deceleration asked at once, the end
+					// faster than the engine could spool back (12 t, full-stick climb: -0.23 m/s past the stop, settled in 3.95 s).
+					// 0.6.3's closed form a = j (sqrt(tau^2 + 2 v / j) - tau) with the 80 % cap made the descent's stop slower.
+					bool climbStop = holdDir > 0f;
+					float vAl = Mathf.Max(0f, hdot * holdDir);
+					// (the predictor: the speed left at the end of the stop if the deceleration aC were asked for one RPM lead
+					// (the time the throttle's over-drive takes to bring the RPM onto its target) and the thrust then sent back
+					// to the hover's; the stop asks the aC that leaves none: the full cap while even that leaves some, nothing
+					// once the hover's thrust alone already would, between them the root (regula falsi on the engine law))
+					float aBias = Mathf.Clamp(accYF - aLiftF, -3f, 3f);
+					float aCap = climbStop ? 4f : aCapUp;
+					float aC = 0f;
+					float vEnd;
+					if (Plugin.StovlPushEstimator)
+					{
+						// 0.6.5 (StovlPushEstimator): 0.6.4's plan (a deceleration aC held for the time the thrust takes to close
+						// on a demand, then the hover's thrust; the stop asks the aC that leaves no speed, Illinois regula falsi
+						// on the engine law), the hold being the RPM lead plus the delay the force was measured to trail the RPM
+						// by, and the prediction running on the learned lift and push. The aim leaves the speed the prediction may
+						// be wrong by: the estimator's measured error over the time the thrust still needs to come back, which
+						// shrinks to nothing as it gets back. (Bench, shorter holds 0.017-0.10 s: the end of the stop went
+						// unstable, a 2-frame throttle wiggle, as the RPM's first frames carry most of a demand's effect and each
+						// new plan counted it again; a brake committed frame by frame, or a full-cap brake with a switch time,
+						// chattered while the spool-back pinned the throttle, where the end speed does not move with aC.)
+						float tH = RpmLead - PushC(2);
+						vEnd = PredictStopEnd(vAl, holdDir, aBias, 0f, tH, out float tRec);
+						float vMargin = StopMargin(tRec);
+						vEnd -= vMargin;
+						if (vEnd > 0f)
+						{
+							float vCap = PredictStopEnd(vAl, holdDir, aBias, aCap, tH) - vMargin;
+							if (vCap >= 0f)
+							{
+								aC = aCap;
+							}
+							else
+							{
+								float lo = 0f, hi = aCap, vLo = vEnd, vHi = vCap;
+								int side = 0;
+								float m = 0.5f * aCap;
+								for (int it = 0; it < 14; it++)
+								{
+									m = lo + (hi - lo) * vLo / Mathf.Max(1e-5f, vLo - vHi);
+									float vm = PredictStopEnd(vAl, holdDir, aBias, m, tH) - vMargin;
+									if (Mathf.Abs(vm) < 0.0005f || hi - lo < 0.002f) { break; }
+									if (vm > 0f)
+									{
+										lo = m; vLo = vm;
+										if (side == 1) { vHi *= 0.5f; }
+										side = 1;
+									}
+									else
+									{
+										hi = m; vHi = vm;
+										if (side == -1) { vLo *= 0.5f; }
+										side = -1;
+									}
+								}
+								aC = m;
+							}
+						}
+					}
+					else
+					{
+						// 0.6.4: the deceleration aC held for one RPM lead and then the hover's thrust; the root in aC
+						float tH = RpmLead;
+						vEnd = PredictStopEnd064(vAl, holdDir, aBias, 0f, tH);
+						if (vEnd > 0f)
+						{
+							float vCap = PredictStopEnd064(vAl, holdDir, aBias, aCap, tH);
+							if (vCap >= 0f)
+							{
+								aC = aCap;
+							}
+							else
+							{
+								float lo = 0f, hi = aCap, vLo = vEnd, vHi = vCap;
+								for (int it = 0; it < 6; it++)
+								{
+									float m = lo + (hi - lo) * vLo / Mathf.Max(1e-4f, vLo - vHi);
+									float vm = PredictStopEnd064(vAl, holdDir, aBias, m, tH);
+									if (vm > 0f) { lo = m; vLo = vm; } else { hi = m; vHi = vm; }
+									if (Mathf.Abs(vm) < 0.002f) { break; }
+								}
+								aC = lo + (hi - lo) * vLo / Mathf.Max(1e-4f, vLo - vHi);
+							}
+						}
+					}
+					dbgStopJ = vEnd;
+					hdotCmd = hdot;
+					hdotFF = (0f - holdDir) * aC;
+					dbgStopA = aC;
 				}
 				else if (holdDir != 0f)
 				{

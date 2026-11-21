@@ -46,6 +46,11 @@ CI (`.github/workflows/native-core.yml`) does this on every push: it builds the 
 must match), publishes a signed build-provenance attestation for the DLL, and fails if the committed prebuilt is not
 that build. `bash native/build.sh linux` builds the bench's `.so` (not shipped).
 
+## Two builds
+`build.sh <src> <out.dll>` builds the plugin in pure C# (no native code, no P/Invoke, no embedded core): that is the main
+release zip and the one listed on NOMM. `build.sh <src> <out.dll> -define:NATIVE_CORE` embeds `native/prebuilt/Vortex_FcsCore.dll`
+and binds to it: that is the optional `…-NativeCore.zip` on the GitHub release. Same control laws in both.
+
 ## Verify a shipped core
 The core inside a release is `Vortex_FcsCore.dll`, an embedded resource of `Vortex_FS20_FCS.dll` (ILSpy / dnSpy:
 Resources > Vortex_FcsCore.dll > Save). The game also writes it to `BepInEx\cache\Vortex_FcsCore\<hash>\Vortex_FcsCore.dll`.

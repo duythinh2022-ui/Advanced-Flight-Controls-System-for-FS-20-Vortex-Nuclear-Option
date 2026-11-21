@@ -3,8 +3,12 @@
 M="/home/claude/game/Nuclear Option/NuclearOption_Data/Managed"; B="/home/claude/game/Nuclear Option/BepInEx/core"
 SRC="$1"; OUT="$2"; DEF="$3"
 # 1.1.1: the native core goes inside the plugin DLL (resource <Lib>.dll; FcsNative.Extract writes it out at load)
+# 0.6.6: only in the native build: build.sh <src> <out.dll> -define:NATIVE_CORE. Without it (the default, the NOMM build) the
+# DLL is pure C#: no native core embedded, no P/Invoke.
 LIB=$(grep -o 'public const string Lib = "[A-Za-z0-9_]*"' "$SRC/FcsNative.cs" | cut -d'"' -f2); CORE="$(dirname "$0")/native/prebuilt/$LIB.dll"
-[ -n "$LIB" ] && [ -f "$CORE" ] && DEF="$DEF -resource:$CORE,$LIB.dll" || echo "build.sh: no native core to embed ($CORE)" >&2
+if [[ "$DEF" == *NATIVE_CORE* ]]; then
+  [ -n "$LIB" ] && [ -f "$CORE" ] && DEF="$DEF -resource:$CORE,$LIB.dll" || { echo "build.sh: NATIVE_CORE but no native core to embed ($CORE)" >&2; exit 1; }
+fi
 CSC=$(ls /usr/lib/dotnet/sdk/*/Roslyn/bincore/csc.dll | head -1)
 dotnet "$CSC" -nologo -noconfig -nostdlib+ -target:library -langversion:9.0 -unsafe+ -optimize+ -deterministic -nowarn:CS0436,CS1701,CS1702 $DEF \
  -out:"$OUT" \
